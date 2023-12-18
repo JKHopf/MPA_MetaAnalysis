@@ -1,0 +1,801 @@
+---
+title: "Data Cleaning"
+author: "Main Author: Jess Hopf"
+date: "Oct 2023"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+# Versions used to create this document
+#   R version 4.0.3 (2020-10-10)
+#   tidyverse_1.3.0 (forcats_0.5.1  stringr_1.4.0  dplyr_1.0.4   purrr_0.3.4      
+#                    readr_1.4.0    tidyr_1.1.2    tibble_3.1.2  ggplot2_3.3.4)  
+
+
+# Automatically installs required packages if needed:
+if(!require(tidyverse))install.packages("tidyverse")
+
+# load required packages
+library(tidyverse); library(readxl); library(waffle)
+library(scales)
+```
+
+# Purpose: 
+This code reads in and cleans the master data file.
+It also create so basic graphs exploring the data. 
+
+*Input files:* 
+- 'MPA_MetaAnalysis_StudyData.xlsx' (main data collected)
+- 'organism_names_sorted.xlsx' (all names sorted by harvest statues (Y/N), and whether they should be included in the analysis or not)
+
+*Output file:* 
+- 'MPA_MetaAnalysis_StudyData_cleaned.Rdata'
+
+*Other notes:* 
+- A lot of the data cleaning is just checking consistencies. Therefore, a lot of this code runs checks and shouldn't find anything as those issues have been fixed
+
+
+# Set up workspace and read-in file 
+
+```{r}
+# clear all current variable assignments
+    rm(list = ls())
+
+# read in master data file
+  MA_Data <- read_excel("Data/MPA_MetaAnalysis_StudyData_working.xlsx", sheet = "Raw Data")
+  
+# read in harvested lists
+# nb: Harvested col, unknown = some might be (i.e., this may be a grouping of multiple species, some of which may be harvested)
+  Harvest_list_sci <- read_excel("Data/organism_names_sorted.xlsx", sheet = "Sci_names")
+  Harvest_list_oth <- read_excel("Data/organism_names_sorted.xlsx", sheet = "Others")
+  
+```
+
+
+# cleaning and checking data
+
+## Basic cleaning
+
+```{r}
+# Get columns into correct types
+  # response ratios and percentage change in numbers
+  # MPA age into numeric
+  MA_Data_Clean <- MA_Data %>%
+    mutate(across(c(Response_ratio, Percent_change, Res_age_end), as.numeric))
+  
+  # Relevant things to lower case
+  MA_Data_Clean <- MA_Data_Clean %>% 
+    mutate(Common_name = tolower(Common_name),
+           Taxonomic_unit = tolower(Taxonomic_unit))
+  
+# Remove empty rows (bottom of the spreadsheet)
+  MA_Data_Clean <- MA_Data_Clean[rowSums(is.na(MA_Data_Clean)) != ncol(MA_Data_Clean), ]
+  
+# Remove non-required cols
+  MA_Data_Clean <- MA_Data_Clean %>% 
+    select(-`Duplicate check`,-In_Zotero, -`Reserve age at end of study (old)`,
+           -`PC (old)`)
+
+```
+
+## Checking variables
+
+These things are used to go back and manually update the data in the master file.
+Manually update = double-checking original source & aligning text between entries
+(e.g., reserve name may differ slightly between references, we change them to be the same).
+
+### species/taxa/groupings
+```{r}
+# checking all species names in the master file match those in the harvested list
+full_join(MA_Data_Clean %>% select(Organism_name),
+                    Harvest_list_sci, 
+                    by = c("Organism_name" = "Sci_name")) %>% 
+            filter(is.na(Harvested)) %>% pull(Organism_name) %>% unique()
+
+
+# checking that those that don't have species names (but have common names are in the harvest list)
+left_join(MA_Data_Clean %>% filter(is.na(Organism_name)) %>% select(Common_name),
+                    Harvest_list_oth, 
+                    by = c("Common_name" = "Name")) %>% 
+            filter(is.na(Harvested)) %>% pull(Common_name) %>% unique() %>% sort()
+
+# number of unique species and groupings
+MA_Data_Clean %>% select(Organism_name) %>% unique() %>% count
+MA_Data_Clean %>% filter(is.na(Organism_name)) %>% select(Common_name) %>% unique() %>% count
+
+# categories
+MA_Data_Clean %>% select(Taxonomic_unit) %>% unique()
+
+MA_Data_Clean %>% 
+  filter(Taxonomic_unit %in% c("trophic group", "functional group", "morphological group", "generic")) %>% 
+  select(Taxonomic_unit, Organism_name, Common_name) %>% unique() %>% 
+  arrange(Common_name)    
+```
+
+
+### Reserves
+
+```{r}
+# looking at individual reserve and MPA network names
+MA_Data_Clean %>% select(Country, Reserve, MPA_network, Aggregated_data_areas) %>% 
+  unique() %>% arrange(Country, MPA_network)
+
+```
+
+
+### Trying to get a sense of whats in the data
+
+```{r}
+# looking at reserves x taxonomic unit to check for duplicates 
+# (i.e., are duplicates because there are >1 studies on that reserve x group, or
+# because of data entry issues)
+MA_Data_Clean %>% group_by(Reserve) %>% 
+  select(Reserve, Organism_name, Common_name, Taxonomic_unit, Var_recorded, Study_type, Source_athr) %>%
+  group_by(Reserve, Organism_name, Common_name, Taxonomic_unit, Var_recorded, Study_type, Source_athr) %>% 
+  summarise(n())
+
+ggplot(MA_Data_Clean) +
+  geom_bar(aes(x = Reserve, fill = Source_athr),
+           stat = "count") +
+  facet_grid(rows = vars(Var_recorded), cols = vars(Study_type)) + 
+  theme(legend.position="none")
+  
+  
+ggplot(MA_Data_Clean %>% filter(!is.na(Organism_name))) +
+  geom_bar(aes(x = Organism_name, fill = Source_athr),
+           stat = "count") +
+  facet_grid(rows = vars(Var_recorded), cols = vars(Study_type)) + 
+  theme(legend.position="none")
+  
+
+```
+
+## Response Ratios
+
+- check that the study type assigned matches the data entered
+- The ones left are marked 'check'. These are ones where the response ratio has 
+  been entered directly. JKH has checked that they are all what they say they are
+```{r}
+MA_Data_Clean %>% 
+  mutate(study_check = ifelse(is.na(BO) & is.na(BI) & !is.na(AO) & !is.na(AI),'IO',
+                              ifelse(is.na(BO) & !is.na(BI) & is.na(AO) & !is.na(AI),'BA', 
+                                     ifelse(is.na(BO) & is.na(BI) & is.na(AO) & is.na(AI), 'check',      
+                              'IOBA')))) %>% 
+  filter(Study_type != study_check) %>% select(Source_athr, Source_yr, Source_jrnl) %>% 
+  unique
+
+```
+
+
+Cleaning up response ration values
+- Response ratio will be NA (infinity) if divided by zero (zero is recorded outside or before)
+- Response ration will be 0 if zero is recorded inside or after
+
+```{r}
+# count number of RR values that are NA (i.e. divided by zero)
+MA_Data_Clean %>% 
+  mutate(Response_ratio = replace(Response_ratio, Response_ratio == "N/A", NA)) %>% 
+  filter(if_any('Response_ratio', is.na)) %>% count
+
+# count number of RR values that are 0
+MA_Data_Clean %>%  filter(Response_ratio==0) %>% count
+
+
+```
+
+
+There are a total of 2318 entries.
+~7% (n = 170) have RR = NA
+~3% (n = 73) have RR = 0
+
+Remove these.
+
+```{r}
+MA_Data_Clean1 <- MA_Data_Clean %>% 
+  mutate(Response_ratio = replace(Response_ratio, Response_ratio == "N/A", NA)) %>% 
+  filter(Response_ratio != 0) %>% 
+  filter(if_any('Response_ratio',  ~!is.na(.)))
+
+```
+
+243 removed, 2075 left.
+
+
+## Removing non-included studies and taxanomic groups
+- BRUV/ROV entries (63 removed [10 removed in previous step], 2013 left)
+- species only (980 left)
+- only higher groupings with fished/harvested species (add dataframe to do this)
+  (900 left)
+
+```{r}
+MA_Data_Clean2 <- MA_Data_Clean1 %>% 
+  filter(is.na(BRUV_ROV_study)) %>% 
+  filter(Taxonomic_unit == 'species')
+
+MA_Data_Clean3 <- left_join(MA_Data_Clean2, 
+                            Harvest_list_sci %>% select(-Notes), 
+                            by = c("Organism_name" = "Sci_name")) %>% 
+  filter(is.na(Exclude))
+
+
+```
+
+## focus only on biomass, denisty and size
+- don't want to use cover (following Lester et al 2009)
+- 879 left
+```{r}
+MA_Data_Clean4 <- MA_Data_Clean3 %>% 
+  filter(Var_recorded %in% c('biomassden', 'density', 'size'))
+
+```
+
+## Removing studies that are aggergated across space 
+- only want studies that focus on individual reserves
+- 708 left
+
+```{r}
+MA_Data_Clean4 <- MA_Data_Clean4 %>% filter(Aggregated_data_areas == "N")
+
+```
+
+
+## Removing outliers
+These studies have extreme responses that are not related to reserve effects (as described in the original papers).
+It makes no difference removing them, or having them in - so leave in
+
+```{r}
+# MA_Data_Clean4 <- MA_Data_Clean4 %>% filter(ID != 1142)
+
+```
+
+
+
+## tag BACI data that have BA
+```{r}
+MA_Data_Clean4 <- MA_Data_Clean4 %>% 
+          mutate(BACIwBA = ifelse(Study_type == "IOBA" & !is.na(BI) & !is.na(AI), 1, 0))
+
+```
+
+
+
+## Export the data
+```{r}
+# save(MA_Data_Clean4, file = "MPA_MetaAnalysis_StudyData_cleaned_v4.Rdata")
+```
+
+--------------------
+
+# Basic plotting / initial results
+This is on the cleaned data
+
+```{r}
+# set cleaned data file
+MA_Data_Clean100 <- MA_Data_Clean4 
+
+# add variable that identifies unique study
+MA_Data_Clean100 <- MA_Data_Clean100 %>% 
+ unite("Unique_study", Source_athr:Source_jrnl, sep = "_", remove = F)
+
+# calculate log response ratio
+MA_Data_Clean100 <- MA_Data_Clean100 %>%
+  mutate(logRR = log10(Response_ratio))
+
+```
+ 
+## Totals
+```{r}
+# total number of studies
+MA_Data_Clean100 %>% select(Unique_study) %>% unique %>% count
+
+# total number of entries
+MA_Data_Clean100 %>% count
+
+```
+ 
+## Reserves and MPA networks
+```{r}
+# Number of reserves studied by country
+MA_Data_Res <- MA_Data_Clean100 %>% select(Country, Reserve) %>% 
+               unique() %>% group_by(Country) %>% 
+               summarise(n_res=n())
+
+# Number of unique studies by country
+MA_Data_Sty <- MA_Data_Clean100 %>% select(Country, Unique_study) %>% 
+               unique() %>% group_by(Country) %>% 
+               summarise(n_sty=n())
+
+# Joint
+MA_Data_ResSty <- full_join(MA_Data_Res, MA_Data_Sty, by = "Country")
+
+ggplot(MA_Data_ResSty, aes(x = Country, y = n_res, fill = n_sty)) +
+  geom_col() +
+  scale_fill_viridis_c() +
+  coord_flip() 
+
+```
+
+```{r}
+# distribution of reserves in each network
+MA_Data_MPA <- MA_Data_Clean100 %>% select(MPA_network, Reserve) %>% 
+  unique() %>% group_by(MPA_network) %>% summarise(Res_per_Network = n())
+
+ggplot(MA_Data_MPA, aes(Res_per_Network)) +
+  geom_histogram(binwidth = 1)
+
+```
+
+
+## Comparison type used 
+```{r}
+# number of ENTRIES that were BA, IO, IOBA
+MA_Data_StyT <- MA_Data_Clean100 %>% 
+  select(Study_type, Unique_study, BACIwBA) %>% 
+  count(Study_type, BACIwBA)
+
+waffle(MA_Data_StyT %>% select(-BACIwBA) %>% group_by(Study_type) %>% summarise(sum(n)), 
+       rows = 20, size = 0.1, colors = c("#462B77", "#489D89","#BADC3B"))
+
+ggplot(MA_Data_StyT, aes(x = Study_type, y = n, fill = BACIwBA)) +
+  geom_bar(stat = 'identity')
+
+ggplot(MA_Data_StyT, aes(x = Study_type, y = n)) +
+  geom_bar(stat = 'identity')
+
+# number of studies that had each (some studies had multiple)
+MA_Data_Clean100 %>% 
+  select(Study_type, Unique_study) %>% 
+  unique() %>% group_by(Study_type) %>% 
+  summarise(n = n())
+
+```
+## Variables collected
+```{r}
+# number of ENTRIES that were biomass, abundance, size
+MA_Data_StyV <- MA_Data_Clean100 %>% 
+  select(Var_recorded, Unique_study) %>% 
+  count(Var_recorded)
+
+
+# number of studies that had each (some studies had multiple)
+MA_Data_Clean100 %>% 
+  select(Var_recorded, Unique_study) %>% 
+  unique() %>% group_by(Var_recorded) %>% 
+  summarise(n = n())
+
+
+```
+
+
+# Initial results
+- for cleaned data focusing on species that are part of a larger group that includes a fished taxon, and which have a non-zero, non-NA response ratio. Also, only including studies that are not aggregated across space. 
+
+Response ratio by individual reserve
+
+```{r}
+# filter for non-NA values in response ratio (RR)
+# summarise by reserve and grab n, mean, max, min RR
+Plot1df <- MA_Data_Clean100 %>% 
+  filter(Var_recorded != "cover") %>%   
+  group_by(Reserve, Var_recorded, Study_type) %>% 
+  summarise(across(c(Response_ratio, Percent_change, logRR),
+                   list(n = ~n(), mean = mean, max = max, min = min)))
+
+ggplot(Plot1df, aes(x = Var_recorded, y = Response_ratio_mean)) +
+  geom_point(size = 3, alpha = 0.4, colour = 'darkblue', stroke = NA,
+             position = position_jitter(width = 0.25, seed = 123)) +
+  geom_linerange(aes(ymin = Response_ratio_min, ymax = Response_ratio_max), 
+                 size = 0.5, alpha = 0.3, colour = 'darkblue',
+                 position = position_jitter(width = 0.25, seed = 123)) +
+  stat_summary(fun = mean, colour = "red", geom = "point", size = 3) +
+  geom_hline(yintercept = 1, linetype = "dashed") +
+  scale_y_log10(breaks= c(0.01,0.1,1,10,100,1000)) +
+  labs(y = "Response ratio (by reserve)", x = "Variable measured") +
+  annotation_logticks(sides = "l") +
+  theme_bw()
+
+# !!!need to plot 0 to 10
+
+ggplot(Plot1df, aes(x = Var_recorded, y = logRR_mean)) +
+  geom_point(size = 3, alpha = 0.4, colour = 'darkblue', stroke = NA,
+             position = position_jitter(width = 0.25, seed = 123)) +
+  geom_linerange(aes(ymin = logRR_min, ymax = logRR_max), 
+                 size = 0.5, alpha = 0.3, colour = 'darkblue',
+                 position = position_jitter(width = 0.25, seed = 123)) +
+  stat_summary(fun = mean, colour = "red", geom = "point", size = 3) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  labs(y = "log10[Response ratio] (by reserve)", x = "Variable measured") +
+  theme_bw()
+
+
+col_vec = c("#462B77", "#489D89", "#BADC3B")
+leg_vals = c("Before-after", "Inside-outside", "BACI")
+
+ggplot(Plot1df,
+       aes(x = Var_recorded, y = logRR_mean,
+                    fill = Study_type, colour = Study_type)) +
+  geom_point(size = 3, alpha = 0.6, stroke = NA,
+             position = position_jitter(width = 0.25, seed = 123)) +
+  geom_linerange(aes(ymin = logRR_min, ymax = logRR_max), 
+                 size = 0.5, alpha = 0.3,
+                 position = position_jitter(width = 0.25, seed = 123)) +
+  scale_color_manual("Comparison metric", values = col_vec, labels = leg_vals) + 
+  scale_fill_manual("Comparison metric", values = col_vec, labels = leg_vals) + 
+  stat_summary(fun = mean, geom = "point", size = 3, shape = 3) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  labs(y = "logRR", x = "Variable measured") +
+  theme_bw()
+
+
+```
+
+
+## Response ratio breakdowns
+ 
+### Study type 
+```{r}
+
+Plot1df <- MA_Data_Clean100 %>% 
+  filter(Var_recorded != "cover") %>%   
+  group_by(Reserve, Var_recorded, Study_type) %>% 
+  summarise(across(c(Response_ratio, Percent_change, logRR),
+                   list(n = ~n(), mean = mean, max = max, min = min)))
+
+ggplot(Plot1df, aes(x = Var_recorded, y = logRR_mean)) +
+  geom_point(size = 3, alpha = 0.4, colour = 'darkblue', stroke = NA,
+             position = position_jitter(width = 0.25, seed = 123)) +
+  geom_linerange(aes(ymin = logRR_min, ymax = logRR_max), 
+                 size = 0.5, alpha = 0.3, colour = 'darkblue',
+                 position = position_jitter(width = 0.25, seed = 123)) +
+  stat_summary(fun = mean, colour = "red", geom = "point", size = 3) +
+  facet_grid(rows = vars(Study_type)) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  labs(y = "Response ratio (by reserve)", x = "Variable measured") +
+  theme_bw()
+
+
+```
+
+
+### Harvested species
+```{r}
+# As above, but with study type included
+
+Plot1df <- MA_Data_Clean100 %>% 
+  filter(Var_recorded != "cover") %>%   
+  group_by(Reserve, Var_recorded, Harvested) %>% 
+  summarise(across(c(Response_ratio, Percent_change, logRR),
+                   list(n = ~n(), mean = mean, max = max, min = min)))
+
+ggplot(Plot1df, aes(x = Var_recorded, y = logRR_mean)) +
+  geom_point(size = 3, alpha = 0.4, colour = 'darkblue', stroke = NA,
+             position = position_jitter(width = 0.25, seed = 123)) +
+  geom_linerange(aes(ymin = logRR_min, ymax = logRR_max), 
+                 size = 0.5, alpha = 0.3, colour = 'darkblue',
+                 position = position_jitter(width = 0.25, seed = 123)) +
+  stat_summary(fun = mean, colour = "red", geom = "point", size = 3) +
+  facet_grid(cols = vars(Harvested)) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  labs(y = "Response ratio (by reserve)", x = "Variable measured") +
+  theme_bw()
+
+
+```
+```{r}
+# As above, but with study type included
+
+
+Plot1df <- MA_Data_Clean100 %>% 
+  filter(Var_recorded != "cover") %>%   
+  group_by(Reserve, Var_recorded, Harvested, Study_type) %>% 
+  summarise(across(c(Response_ratio, Percent_change, logRR),
+                   list(n = ~n(), mean = mean, max = max, min = min)))
+
+ggplot(Plot1df, aes(x = Var_recorded, y = logRR_mean)) +
+  geom_point(size = 3, alpha = 0.4, colour = 'darkblue', stroke = NA,
+             position = position_jitter(width = 0.25, seed = 123)) +
+  geom_linerange(aes(ymin = logRR_min, ymax = logRR_max), 
+                 size = 0.5, alpha = 0.3, colour = 'darkblue',
+                 position = position_jitter(width = 0.25, seed = 123)) +
+  stat_summary(fun = mean, colour = "red", geom = "point", size = 3) +
+  facet_grid(cols = vars(Harvested),
+             rows = vars(Study_type)) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  labs(y = "Response ratio (by reserve)", x = "Variable measured") +
+  theme_bw()
+
+
+# add BA from BACI studies
+# (reset their values)
+extraBA <- MA_Data_Clean100 %>% 
+  filter(Var_recorded != "cover") %>%   
+  filter(BACIwBA == 1) %>% 
+  mutate(Study_type = 'BA', Response_ratio = AI/BI,
+         logRR = log10(Response_ratio))
+
+
+Plot2df <- MA_Data_Clean100 %>% 
+  rbind(extraBA) %>%
+  filter(Var_recorded != "cover") %>%   
+  group_by(Reserve, Var_recorded, Harvested, Study_type) %>% 
+  summarise(across(c(Response_ratio, Percent_change, logRR, BACIwBA),
+                   list(n = ~n(), mean = mean, max = max, min = min))) %>% 
+  mutate(extraBA = ifelse(BACIwBA_mean>0,1,0),
+         extraBA = factor(ifelse(Study_type == "IOBA", 0, extraBA)))
+
+
+
+ggplot(Plot2df, aes(x = Var_recorded, y = logRR_mean, colour = extraBA)) +
+  geom_point(size = 3, alpha = 0.4, stroke = NA,
+             position = position_jitter(width = 0.25, seed = 123)) +
+  geom_linerange(aes(ymin = logRR_min, ymax = logRR_max), 
+                 size = 0.5, alpha = 0.3,
+                 position = position_jitter(width = 0.25, seed = 123)) +
+  scale_color_manual(values = c('darkblue', 'turquoise4')) +
+  stat_summary(fun = mean, colour = "red", geom = "point", size = 3) +
+  facet_grid(cols = vars(Harvested),
+             rows = vars(Study_type)) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  labs(y = "Response ratio (by reserve)", x = "Variable measured") +
+  theme_bw()
+
+
+ggplot(Plot2df, aes(x = Harvested, y = logRR_mean, colour = Harvested)) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  geom_point(aes(shape = extraBA), size = 3, alpha = 0.4, stroke = 1,
+             position = position_jitter(width = 0.25, seed = 123)) +
+  geom_linerange(aes(ymin = logRR_min, ymax = logRR_max), 
+                 size = 0.5, alpha = 0.3,
+                 position = position_jitter(width = 0.25, seed = 123)) +
+  scale_color_manual(values = c('darkblue', 'darkred')) +
+  scale_shape_manual(values = c(16, 1)) + 
+  stat_summary(fun = mean, colour = "black", geom = "point", size = 3) +
+  facet_grid(cols = vars(Study_type),
+             rows = vars(Var_recorded),
+             labeller = as_labeller( c("BA"="Before-after", "IO"="Inside-outside", "IOBA"="BACI",
+                                       "biomassden"="Biomass", 'density'='Abundance', 'size' = 'Size'))) +
+  labs(y = "logRR", x = "Harvest status") +
+  theme_bw()
+
+
+
+```
+
+
+## Reserve age
+
+```{r}
+# remove NAs from reserve age (this study wasnt clear on how long the study lasted)
+
+Plot1df <- MA_Data_Clean100 %>% 
+  filter(!is.na(Res_age_end)) %>% 
+  filter(Var_recorded != "cover") %>% 
+  group_by(Reserve, Var_recorded, Res_age_end) %>% 
+  summarise(across(c(Response_ratio, Percent_change, logRR),
+                   list(n = ~n(), mean = mean, max = max, min = min)))
+
+ggplot(Plot1df, aes(x = Res_age_end, y = logRR_mean)) +
+  geom_point(size = 3, alpha = 0.4, colour = 'darkblue', stroke = NA,
+             position = position_jitter(width = 0.25, seed = 123)) +
+  geom_linerange(aes(ymin = logRR_min, ymax = logRR_max), 
+                 size = 0.5, alpha = 0.3, colour = 'darkblue',
+                 position = position_jitter(width = 0.25, seed = 123)) +
+  geom_smooth(method = "lm", colour = "grey50", se = FALSE) +
+  facet_grid(rows = vars(Var_recorded), scales = "free") +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  labs(y = "Response ratio (by reserve)", x = "Reserve age (yrs)") +
+  theme_bw()
+
+
+Plot1df <- MA_Data_Clean100 %>% 
+  filter(!is.na(Res_age_end)) %>% 
+  filter(Var_recorded != "cover") %>% 
+  group_by(Reserve, Var_recorded, Res_age_end, Study_type, Harvested) %>% 
+  summarise(across(c(Response_ratio, Percent_change, logRR),
+                   list(n = ~n(), mean = mean, max = max, min = min)))
+
+ggplot(Plot1df, aes(x = Res_age_end, y = logRR_mean, colour = Harvested)) +
+  geom_point(size = 3, alpha = 0.4, stroke = NA,
+             position = position_jitter(width = 0.25, seed = 123)) +
+  geom_linerange(aes(ymin = logRR_min, ymax = logRR_max), 
+                 size = 0.5, alpha = 0.3, 
+                 position = position_jitter(width = 0.25, seed = 123)) +
+  facet_grid(cols = vars(Study_type),
+             rows = vars(Var_recorded),
+             labeller = as_labeller( c("BA"="Before-after", "IO"="Inside-outside", "IOBA"="BACI",
+                                       "biomassden"="Biomass", 'density'='Abundance', 'size' = 'Size')),
+             scales = "free") +
+  scale_fill_manual(values = c("darkblue","darkred")) +
+  scale_colour_manual(values = c("darkblue","darkred")) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  labs(y = "Response ratio (by reserve)", x = "Reserve age (yrs)") +
+  theme_bw()
+
+
+# filtering out points
+
+Plot2df <- MA_Data_Clean100 %>% 
+  filter(!is.na(Res_age_end)) %>% 
+  filter(Var_recorded != "cover") %>% 
+  # filter(Res_age_end <50) %>%   # to remove harvested outliers 
+  filter(!(Harvested == "N" & Var_recorded == "biomassden" & Res_age_end >30)) %>% 
+  filter(!(Harvested == "N" & Var_recorded == "density" & Res_age_end > 30 & logRR >2)) %>% 
+  group_by(Reserve, Var_recorded, Harvested, Res_age_end) %>% 
+  summarise(across(c(Response_ratio, Percent_change, logRR),
+                   list(n = ~n(), mean = mean, max = max, min = min)))
+
+ggplot(Plot2df, aes(x = Res_age_end, y = logRR_mean, 
+                    color = factor(Harvested, levels = c("Y","N")))) +
+  geom_point(size = 3, alpha = 0.4, stroke = NA,
+             position = position_jitter(width = 0.25, seed = 123)) +
+  geom_linerange(aes(ymin = logRR_min, ymax = logRR_max), 
+                 size = 0.5, alpha = 0.3, 
+                 position = position_jitter(width = 0.25, seed = 123)) +
+  geom_smooth(method = "lm",  se = T ) +
+  facet_grid(rows = vars(Var_recorded),
+             scales = "free") +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  labs(y = "Response ratio (by reserve)", x = "Reserve age (yrs)") +
+  theme_bw()
+
+
+
+Plot3df <- MA_Data_Clean100 %>% 
+  filter(!is.na(Res_age_end)) %>% 
+  filter(Var_recorded != "cover") %>% 
+  filter(!(Harvested == "N" & Var_recorded == "biomassden" & Res_age_end >30))
+
+ggplot(Plot3df, aes(x = Res_age_end, y = logRR)) +
+  geom_point(aes(color = Reserve), size = 3, alpha = 0.4, stroke = NA,
+             position = position_jitter(width = 0.25, seed = 123)) +
+  geom_smooth(method = "lm",  se = FALSE) +
+  facet_grid(rows = vars(Var_recorded), cols = vars(Harvested),
+             scales = "free") +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  labs(y = "Response ratio (by reserve)", x = "Reserve age (yrs)") +
+  theme_bw()
+
+# plotting harvested and non-harvested pairs (reserve x age)
+
+Plot4df <- MA_Data_Clean100 %>% 
+  filter(!is.na(Res_age_end)) %>% 
+  filter(Var_recorded != "cover") %>% 
+  group_by(Reserve, Var_recorded, Harvested, Res_age_end) %>% 
+  summarise(across(c(Response_ratio, Percent_change, logRR),
+                   list(n = ~n(), mean = mean, max = max, min = min))) %>% 
+  select(Reserve:Res_age_end, logRR_mean:logRR_min) %>% 
+  pivot_wider(names_from = Harvested, values_from = logRR_mean:logRR_min) %>% 
+  filter(!is.na(logRR_mean_Y)) %>% filter(!is.na(logRR_mean_N)) %>% 
+  mutate(Res_age_bin = cut(Res_age_end, seq(0, 60, 10))) %>% 
+  arrange(Res_age_end)
+  
+
+ggplot(Plot4df,
+       aes(y = logRR_mean_Y, x = logRR_mean_N, colour = Res_age_bin)) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = 'grey') +
+  geom_vline(xintercept = 0, linetype = "dashed", colour = 'grey') +
+  geom_point(size = 2) +
+  geom_linerange(aes(ymin = logRR_min_Y, ymax = logRR_max_Y), 
+                 size = 0.5, alpha = 0.3) +
+  geom_linerange(aes(xmin = logRR_min_N, xmax = logRR_max_N), 
+                 size = 0.5, alpha = 0.3) +
+  facet_grid(rows = vars(Var_recorded)) +
+  scale_color_viridis_d() +
+  coord_equal() +
+  labs(y = 'logRR harvested', x = 'logRR non-harvested') +
+  theme_bw()
+
+# # is there a way to get a line between dots from the same reserve?
+# ggplot(Plot4df,
+#        aes(y = logRR_mean_Y, x = logRR_mean_N, colour = Res_age_bin)) +
+#   geom_hline(yintercept = 0, linetype = "dashed", colour = 'grey') +
+#   geom_vline(xintercept = 0, linetype = "dashed", colour = 'grey') +
+#   geom_point(size = 2) +
+#   geom_line(aes(group = Reserve)) +
+#   facet_wrap(rows = vars(Var_recorded), scales = "free") +
+#   scale_color_viridis_d() +
+#   labs(y = 'logRR harvested', x = 'logRR non-harvested') +
+#   theme_bw()
+
+
+# removing age
+Plot4df <- MA_Data_Clean100 %>% 
+  filter(!is.na(Res_age_end)) %>% 
+  filter(Var_recorded != "cover") %>% 
+  group_by(Reserve, Var_recorded, Harvested) %>% 
+  summarise(across(c(Response_ratio, Percent_change, logRR),
+                   list(n = ~n(), mean = mean, max = max, min = min))) %>% 
+  select(Reserve:Harvested, logRR_mean:logRR_min) %>% 
+  pivot_wider(names_from = Harvested, values_from = logRR_mean:logRR_min) %>% 
+  filter(!is.na(logRR_mean_Y)) %>% filter(!is.na(logRR_mean_N)) 
+  
+
+ggplot(Plot4df,
+       aes(y = logRR_mean_Y, x = logRR_mean_N)) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = 'grey') +
+  geom_vline(xintercept = 0, linetype = "dashed", colour = 'grey') +
+  geom_point(size = 2) +
+  geom_linerange(aes(ymin = logRR_min_Y, ymax = logRR_max_Y), 
+                 size = 0.5, alpha = 0.3) +
+  geom_linerange(aes(xmin = logRR_min_N, xmax = logRR_max_N), 
+                 size = 0.5, alpha = 0.3) +
+  facet_grid(rows = vars(Var_recorded)) +
+  scale_color_viridis_d() +
+  coord_equal() +
+  labs(y = 'logRR harvested', x = 'logRR non-harvested') +
+  theme_bw()
+
+
+```
+## Timeseries data
+
+Who has time series data?
+
+```{r}
+# checking missing data
+MA_Data_Clean100 %>% filter(is.na(Time_series_data))
+# no missing data
+
+# pullout and summarise (by study) those with time series data, but that didnt have data before
+TSIO <- MA_Data_Clean100 %>% 
+  filter(Time_series_data == "Y" & Study_type == "IO") %>%
+  group_by(Unique_study, Reserve, Res_age_start, Study_type) %>% 
+  summarise(across(logRR, list(n = ~n()))) 
+
+# number of study x reserve combos with timeseries data
+dim(TSIO)[1]
+
+# number of studies (IO only)
+TSIO %>% ungroup %>% select(Unique_study) %>% unique %>% count()
+
+MA_Data_Clean100 %>% select(Unique_study, Time_series_data) %>%
+  unique %>% group_by(Time_series_data) %>% 
+  summarise(n())
+
+
+```
+
+
+
+# Most commonly studied  spp
+```{r}
+MA_Data_Clean100 %>% group_by(Var_recorded) %>%
+  count(Organism_name) %>% arrange(desc(n)) 
+
+
+JE_df <- MA_Data %>% filter(Organism_name == "Jasus edwardsii") %>%
+  group_by(Reserve, Var_recorded)
+
+JE_df_res <- JE_df %>% summarise(mean = mean(Response_ratio), n = n())
+
+JE_df_res %>% ungroup() %>% group_by(Var_recorded) %>% summarise(mean = mean(mean))
+
+
+```
+
+
+```{r}
+library(rfishbase)
+
+Spp <- MA_Data_Clean100 %>% 
+  filter(Harvested == "Y") %>% 
+  pull(Organism_name) %>% unique
+
+fb_tbl("species") %>% 
+  mutate(sci_name = paste(Genus, Species)) %>%
+  filter(sci_name %in% Spp) %>% 
+  select(sci_name, FBname, Importance)
+
+
+```
+
+
+
+
+
+
+
+
+

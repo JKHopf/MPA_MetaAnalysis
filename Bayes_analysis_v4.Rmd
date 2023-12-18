@@ -1,0 +1,1987 @@
+---
+title: "Bayes Anaylsis"
+author: "Jess Hopf"
+date: "2023-06-22"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+# Versions used to create this document
+#   R version 4.0.3 (2020-10-10)
+#   tidyverse_1.3.0 (forcats_0.5.1  stringr_1.4.0  dplyr_1.0.4   purrr_0.3.4      
+#                    readr_1.4.0    tidyr_1.1.2    tibble_3.1.2  ggplot2_3.3.4)  
+
+
+# Automatically installs required packages if needed:
+if(!require(tidyverse))install.packages("tidyverse")
+
+# load required packages
+library(tidyverse); library(readxl); library(scales); 
+library(rstan); library(broom.mixed); library(rstanarm)
+library(bayesplot); library(ggpubr); library(tidybayes)
+
+# set number of cores for stan runs
+options(mc.cores = 4)
+```
+
+# Purpose: 
+This code reads in the cleaned data and runs a Bayesian analysis looking at response ratios.
+
+*Input files:* 
+- 'MPA_MetaAnalysis_StudyData_cleaned.Rdata' (cleaned data)
+- 'Lester_Fig2_SMR_Data_Piscoweb.xls' (Data from Lester et al. 2006, supp materials)
+
+*Other notes:* 
+
+
+# Set up workspace and read-in file 
+```{r}
+# clear all current variable assignments
+    rm(list = ls())
+
+# read in master data file
+  load("MPA_MetaAnalysis_StudyData_cleaned_v4.Rdata")
+  MA_Data <- MA_Data_Clean4
+  rm(MA_Data_Clean4)
+  
+# read in Lester data
+  Lester_in <- read_excel("Data/Lester_Fig2_SMR_Data_Piscoweb.xls")
+  
+```
+
+
+# Lester data
+
+## clean
+```{r}
+# removed . and rename cols
+Lester_df <- Lester_in %>% mutate(across(contains("Change"),  ~na_if(.,"."))) %>% 
+  rename(biomassden = BioChange, density = DensChange,
+         size = SizeChange, richness = DivChange)
+
+# get into long format & remove empty (NA) rows & convert to numeric
+Lester_df <- Lester_df %>% pivot_longer(cols = biomassden:richness,
+                                        names_to = "Var_recorded", 
+                                        values_to = "Percent_change") %>% 
+            na.omit() %>% 
+            mutate(Percent_change = as.numeric(Percent_change))
+
+# convert percentage change to response ratio and logRR
+Lester_df <- Lester_df %>% 
+  mutate(Response_ratio = Percent_change/100+1,
+         logRR = log10(Response_ratio))
+
+```
+
+
+## plot
+Checking if it matches Fig 2 in the paper
+
+```{r}
+ggplot(Lester_df, aes(x = Var_recorded, y = Percent_change)) +
+  stat_summary(fun = mean, fill = "grey80", geom = "bar", size = 3) +
+  geom_point(size = 3, alpha = 0.4, colour = 'darkblue', stroke = NA,
+             position = position_jitter(width = 0.2, seed = 123)) +
+  stat_summary(fun = median, colour = "red", geom = "point", size = 3) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  labs(y = "Percentage change (by reserve)", x = "Variable measured") +
+  theme_bw()
+```
+
+Plot response ratio to compare to ours
+
+```{r}
+# remove richness
+Lester_df <- Lester_df %>% filter(Var_recorded != "richness")
+
+ggplot(Lester_df, 
+       aes(x = Var_recorded, y = logRR)) +
+  geom_point(size = 3, alpha = 0.4, colour = 'darkblue', stroke = NA,
+             position = position_jitter(width = 0.2, seed = 123)) +
+  stat_summary(fun = mean, colour = "red", geom = "point", size = 3) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  labs(y = "log10[response ratio] (by reserve)", x = "Variable measured") +
+  theme_bw()
+
+```
+
+
+
+## Get summary stats
+Get the mean and SE
+
+```{r}
+# basics model priors
+priors <- Lester_df %>% 
+  group_by(Var_recorded) %>% 
+  summarise(meanlogRR = mean(logRR), 
+            SDlogRR = sd(logRR),
+            SElogRR = sd(logRR)/sqrt(n()))
+  
+priors
+```
+
+plot densities for logRR
+```{r}
+ggplot(Lester_df %>% filter(Var_recorded != "richness"), 
+       aes(fill = Var_recorded, x = logRR)) +
+  geom_density(alpha = 0.5) +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  scale_fill_viridis_d() +
+  theme_bw()
+
+```
+
+# MA Data
+```{r}
+# add logRR
+MA_Data <- MA_Data %>% mutate(logRR = log10(Response_ratio))
+
+# summarise by individual reserve 
+MA_Data_res <- MA_Data %>% 
+  group_by(Reserve, Var_recorded) %>% 
+  summarise(across(c(logRR, Response_ratio, Percent_change),
+                   list(mean = mean)))
+
+```
+
+plot densities
+```{r}
+ggplot(MA_Data_res %>% filter(Var_recorded != "richness"), 
+       aes(fill = Var_recorded, x = logRR_mean)) +
+  geom_density(alpha = 0.5) +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  scale_fill_viridis_d() +
+  theme_bw()
+
+```
+
+# Analysis
+
+## Basic Model
+
+All data combined for each variable (biomassden, density, size)
+
+### Biomass density
+
+```{r}
+# data = our collected MA data
+Our_data <- MA_Data_res %>% 
+  filter(Var_recorded == "biomassden") %>% 
+  pull(logRR_mean)
+
+# using rstan
+# see file Gaussian_model_base.stan for model specifics
+
+# Run 
+GM_sim_BD <- stan("Gaussian_model_base.stan",
+                   data = list(Y = Our_data, n = length(Our_data), # our data
+                               theta = priors$meanlogRR[1], tau = priors$SDlogRR[1]),  # priors
+                   chains = 4,
+                   iter = 5000*2,
+                   seed = 84735)
+
+# output object gives the mean etc. for the paras (mu and sigma), and the log probability
+GM_sim_BD 
+
+
+```
+
+#### Diagnostics and posterior predictions
+```{r}
+# function that outputs basic diagnostics 
+# + posterior parameter estimate values and density plots
+MCMC_diagnostics <- function(MCMC_draws){
+  
+# effective sample size ratio (want >0.1)
+ne <- neff_ratio(MCMC_draws, c("mu","sigma"))
+
+# r-hat (variability within chains compared to between chains, want ~  1)
+rh <- rhat(MCMC_draws, c("mu","sigma"))
+
+# MCMC trace plot
+tp <- mcmc_trace(MCMC_draws, pars = c("mu","sigma"), size = 0.1)
+
+# Histogram of the Markov chain values (all chains combined)
+mcmch <- mcmc_hist(MCMC_draws, pars = c("mu","sigma")) + 
+  yaxis_text(TRUE) + 
+  ylab("count")
+
+# Density plots of individual chains
+dchains <- mcmc_dens_overlay(MCMC_draws, pars = c("mu","sigma")) + 
+  ylab("density")
+
+# checking autocorrelation in chains
+ac <- mcmc_acf(MCMC_draws, pars = c("mu","sigma"))
+
+# Posterior predictions  
+# summary (mediam + middle 95% confidence)
+pp <- tidy(MCMC_draws, conf.int = T, conf.level = T)
+
+# plot middle 95%
+e <- mcmc_areas(MCMC_draws, c("mu","sigma"), prob = 0.95)
+
+return(list(ne, rh, tp, mcmch, dchains, ac, pp, e))
+
+}
+
+MCMC_diagnostics(GM_sim_BD) 
+
+```
+
+#### Posterior parameter estimate values
+```{r}
+# get the estimated posterior parameter values (for all chains)
+post_params_BD <- extract(GM_sim_BD)
+
+# put in table form
+post_model_BD <- as_tibble(post_params_BD) %>% 
+  mutate(Var_recorded = "biomassden")
+
+```
+
+#### Posterior prediction values
+```{r}
+# posterior predictions of mean logRR
+# uses the modelled posterior values to predict new (future) data
+# puts it into a form that can be eaisly plotted
+post_predict_BD <- as_tibble(post_model_BD) %>% 
+  mutate(post_prediction = rnorm(20000, mu, sigma)) %>% 
+  select(post_prediction, Var_recorded) 
+
+```
+
+
+### Density (abundance)
+
+```{r}
+# set # cores
+options(mc.cores = 4)
+
+# data = our collected MA data
+Our_data <- MA_Data_res %>% 
+  filter(Var_recorded == "density") %>% 
+  pull(logRR_mean)
+
+# Run 
+GM_sim_D <- stan("Gaussian_model_base.stan",
+                   data = list(Y = Our_data, n = length(Our_data), # our data
+                               theta = priors$meanlogRR[2], tau = priors$SDlogRR[2]),  # priors
+                   chains = 4,
+                   iter = 5000*2,
+                   seed = 84735)
+
+# output object gives the mean etc. for the paras (mu and sigma), and the log probability
+GM_sim_D
+```
+
+#### Diagnostics and Posterior predictions
+```{r}
+MCMC_diagnostics(GM_sim_D) 
+
+```
+
+#### Posterior parameter estimate values
+```{r}
+# get the estimated posterior parameter values (for all chains)
+post_params_D <- extract(GM_sim_D)
+
+# put in table form
+post_model_D <- as_tibble(post_params_D) %>% 
+  mutate(Var_recorded = "density")
+
+```
+
+#### Posterior prediction values
+```{r}
+# posterior predictions of mean logRR
+# uses the modelled posterior values to predict new (future) data
+# puts it into a form that can be eaisly plotted
+post_predict_D <- as_tibble(post_model_D) %>% 
+  mutate(post_prediction = rnorm(20000, mu, sigma)) %>% 
+  select(post_prediction, Var_recorded) 
+
+```
+
+
+### Size
+
+```{r}
+# set # cores
+options(mc.cores = 4)
+
+# data = our collected MA data
+Our_data <- MA_Data_res %>% 
+  filter(Var_recorded == "size") %>% 
+  pull(logRR_mean)
+
+# Run 
+GM_sim_S <- stan("Gaussian_model_base.stan",
+                   data = list(Y = Our_data, n = length(Our_data), # our data
+                               theta = priors$meanlogRR[3], tau = priors$SDlogRR[3]),  # priors
+                   chains = 4,
+                   iter = 5000*2,
+                   seed = 84735)
+
+# output object gives the mean etc. for the paras (mu and sigma), and the log probability
+GM_sim_S
+```
+
+#### Diagnostics and Posterior predictions
+```{r}
+MCMC_diagnostics(GM_sim_S) 
+
+```
+
+#### Posterior parameter estimate values
+```{r}
+# get the estimated posterior parameter values (for all chains)
+post_params_S <- extract(GM_sim_S)
+
+# put in table form
+post_model_S <- as_tibble(post_params_S) %>% 
+  mutate(Var_recorded = "size")
+
+```
+
+#### Posterior prediction values
+```{r}
+# posterior predictions of mean logRR
+# uses the modelled posterior values to predict new (future) data
+# puts it into a form that can be eaisly plotted
+post_predict_S <- as_tibble(post_model_S) %>% 
+  mutate(post_prediction = rnorm(20000, mu, sigma)) %>% 
+  select(post_prediction, Var_recorded) 
+
+```
+
+### Plotting all
+
+Overview plot of our data (blue dots, mean = orange), a sample of the estimated mu and sigma (cyan dots and lines) and the prior values (red dots and lines = theta and tau)
+```{r}
+post_plot <- rbind(post_model_BD, post_model_D, post_model_S) %>% 
+  group_by(Var_recorded) %>% slice_sample(n = 50)
+data_plot <- MA_Data_res %>% filter(Var_recorded != "cover")
+
+
+ggplot() +
+  geom_point(data = data_plot, aes(y = logRR_mean, x = 0.5),
+    size = 1.8, alpha = 0.6, colour = 'darkblue', stroke = NA,
+             position = position_jitter(width = 0.15, seed = 957)) +
+  stat_summary(data = data_plot, aes(y = logRR_mean, x = 0.5),
+               fun = mean, colour = "orange", geom = "point", size = 3) +
+  geom_point(data = post_plot, aes(y = mu, x = 1),
+    size = 3, alpha = 0.4, colour = 'darkcyan', stroke = NA,
+             position = position_jitter(width = 0.25, seed = 123)) +
+  geom_linerange(data = post_plot,
+                 aes(y = mu, x = 1, ymin = mu-sigma^2, ymax = mu+sigma^2),
+                 size = 0.5, alpha = 0.3, colour = 'darkcyan',
+                  position = position_jitter(width = 0.25, seed = 123)) +
+  geom_point(data = priors, aes(y = meanlogRR, x = 1),
+             shape = 15, size = 3, alpha = 0.9, colour = 'red', stroke = NA) +
+  geom_linerange(data = priors,
+                 aes(y = meanlogRR, x = 1,
+                     ymin = meanlogRR-SDlogRR^2, ymax = meanlogRR+SDlogRR^2),
+                 size = 1, alpha = 0.8, colour = 'red') +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  facet_wrap(~Var_recorded, scales = "free_y") +
+  theme_light() +
+  theme(axis.text.x = element_blank(), axis.ticks.x = element_blank(),
+        panel.grid.major.x = element_blank(), panel.grid.minor.x = element_blank()) +
+  xlab("") + ylab("logRR") +
+  xlim(c(0.2,1.4))
+  
+  
+
+```
+
+Posterior model estimates
+```{r}
+# join posterior prediction tables
+post_pred_plot <- rbind(post_predict_BD, post_predict_D, post_predict_S) 
+
+
+PPP_sum <- post_pred_plot %>% group_by(Var_recorded) %>% 
+  summarise(mean = mean(post_prediction), median = median (post_prediction)) %>% 
+  mutate(lmin = ifelse(Var_recorded == "size", 3.5, 1),
+         lmax = lmin + 0.5,
+         llabel = round(mean,2))
+
+ggplot(post_pred_plot,
+       aes(x = post_prediction)) +
+  geom_density(alpha = 0.1, colour = "grey20", fill = "grey20") +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  geom_segment(data = PPP_sum, 
+               aes(x = mean, xend = mean, y = lmin, yend = lmax)) +
+  geom_text(data = PPP_sum, 
+               aes(x = mean, y = lmax + 0.2, label = llabel), hjust = 0) + 
+  facet_grid(rows = vars(Var_recorded), scales = "free") +
+  theme_bw() +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank()) + 
+  xlab("Posterior model prediction (mean logRR value per reserve)")
+
+## Calc proportion < 0
+post_pred_plot %>% group_by(Var_recorded) %>% filter(post_prediction < 0) %>% summarise(n=n()) %>% mutate(prop = n/20000)
+```
+
+## Harvest predictor
+
+Using harvesting status (is the species harvested or not?) as a categorical predictor.
+
+### Priors
+Enter priors from Lester Table S2
+```{r}
+priorsH <- tibble(Var_recorded = c("biomassden", "density", "size", "biomassden", "density", "size"),
+                  Percent_change = c(820,385,28,33,115,20),
+                  Harvested = c("Y", "Y", "Y", "N", "N", "N")) 
+
+# get logRR
+priorsH <- priorsH %>% 
+  mutate(Response_ratio = Percent_change/100+1,
+         logRR = log10(Response_ratio))
+```
+
+### MA data
+```{r}
+# summarise by individual reserve and spp status
+MA_Data_resH <- MA_Data %>% 
+  group_by(Reserve, Var_recorded, Harvested) %>% 
+  summarise(across(c(logRR, Response_ratio, Percent_change),
+                   list(mean = mean)))
+
+```
+
+### biomassden
+```{r}
+# switching to rstanarm from now on
+
+# data = our collected MA data
+Our_data <- MA_Data_resH %>% filter(Var_recorded == "biomassden") 
+
+PH <- priorsH %>% 
+  filter(Var_recorded == "biomassden") %>% 
+  pull(logRR)
+
+# run model
+harvested_model_BD <- stan_glm(
+  logRR_mean ~ Harvested,
+  data = Our_data, family = gaussian,
+  prior_intercept = normal(PH[2], priors$SDlogRR[1]^2),
+  prior = normal(0, 2.5, autoscale = T),  # weakly informative prior
+  prior_aux = exponential(1, autoscale = T),  # weakly informative prior
+  chains = 4, iter = 5000*2, seed = 84735)
+
+```
+
+#### Diagnostics & plots
+```{r}
+mcmc_trace(harvested_model_BD, size = 0.1)
+mcmc_dens_overlay(harvested_model_BD)
+mcmc_acf(harvested_model_BD)
+
+# Posterior summary statistics
+tidy(harvested_model_BD, effects = c("fixed", "aux"),
+     conf.int = TRUE, conf.level = 0.80) %>% 
+  select(-std.error)
+
+# pull out posterior values for parameters
+post_params_BD <- as.data.frame(harvested_model_BD) %>% 
+  mutate(non_harvested = `(Intercept)`, 
+         harvested = `(Intercept)` + HarvestedY) 
+
+# plot posterior modelled value distributions before transformation
+post_params_BD %>% mcmc_areas(pars = c("(Intercept)", "HarvestedY", "sigma"))
+
+# plot posterior modelled value distributions after transformation
+post_params_BD %>% mcmc_areas(pars = c("non_harvested", "harvested", "sigma"))
+```
+
+#### Modeled posterior values
+```{r}
+# table of the predicted parameter values
+post_model_BD <- as_tibble(post_params_BD) %>% 
+  select(non_harvested, harvested, sigma) %>% 
+  mutate(Var_recorded = "biomassden") %>% 
+  pivot_longer(cols = non_harvested:harvested, names_to = "Harvested",
+               values_to = "mu")
+
+```
+
+#### Posterior prediction values
+```{r}
+# posterior predictions of mean non-harevsted and harvested values
+# uses the modelled posterior values to predict new (future) data
+# puts it into a form that can be eaisly plotted
+post_predict_BD <- as_tibble(post_params_BD) %>% 
+  mutate(non_harvested = rnorm(20000, non_harvested, sigma),
+         harvested = rnorm(20000, harvested, sigma)) %>% 
+  select(non_harvested, harvested) %>% 
+  pivot_longer(non_harvested:harvested, 
+               names_to = "spp_status", values_to = "post_prediction") %>% 
+  mutate(Var_recorded = "biomassden")
+
+
+```
+
+### density
+```{r}
+# data = our collected MA data
+Our_data <- MA_Data_resH %>% filter(Var_recorded == "density") 
+
+PH <- priorsH %>% 
+  filter(Var_recorded == "density") %>% 
+  pull(logRR)
+
+# run model
+harvested_model_D <- stan_glm(
+  logRR_mean ~ Harvested,
+  data = Our_data, family = gaussian,
+  prior_intercept = normal(PH[2], priors$SDlogRR[2]^2),
+  prior = normal(0, 2.5, autoscale = T), 
+  prior_aux = exponential(1, autoscale = T),
+  chains = 4, iter = 5000*2, seed = 84735)
+
+```
+
+
+#### Diagnostics & plots
+```{r}
+mcmc_trace(harvested_model_D, size = 0.1)
+mcmc_dens_overlay(harvested_model_D)
+mcmc_acf(harvested_model_D)
+
+# Posterior summary statistics
+tidy(harvested_model_D, effects = c("fixed", "aux"),
+     conf.int = TRUE, conf.level = 0.80) %>% 
+  select(-std.error)
+
+# pull out posterior values for parameters
+post_params_D <- as.data.frame(harvested_model_D) %>% 
+  mutate(non_harvested = `(Intercept)`, 
+         harvested = `(Intercept)` + HarvestedY) 
+
+# plot posterior modelled value distributions before transformation
+post_params_D %>% mcmc_areas(pars = c("(Intercept)", "HarvestedY", "sigma"))
+
+# plot posterior modelled value distributions after transformation
+post_params_D %>% mcmc_areas(pars = c("non_harvested", "harvested", "sigma"))
+```
+
+#### Modeled posterior values
+```{r}
+# table of the predicted parameter values
+post_model_D <- as_tibble(post_params_D) %>% 
+  select(non_harvested, harvested, sigma) %>% 
+  mutate(Var_recorded = "density") %>% 
+  pivot_longer(cols = non_harvested:harvested, names_to = "Harvested",
+               values_to = "mu")
+
+```
+
+#### Posterior prediction values
+```{r}
+# posterior predictions of mean non-harevsted and harvested values
+# uses the modelled posterior values to predict new (future) data
+# puts it into a form that can be eaisly plotted
+post_predict_D <- as_tibble(post_params_D) %>% 
+  mutate(non_harvested = rnorm(20000, non_harvested, sigma),
+         harvested = rnorm(20000, harvested, sigma)) %>% 
+  select(non_harvested, harvested) %>% 
+  pivot_longer(non_harvested:harvested, 
+               names_to = "spp_status", values_to = "post_prediction") %>% 
+  mutate(Var_recorded = "density")
+
+
+```
+
+
+### size
+```{r}
+# data = our collected MA data
+Our_data <- MA_Data_resH %>% filter(Var_recorded == "size") 
+
+PH <- priorsH %>% 
+  filter(Var_recorded == "size") %>% 
+  pull(logRR)
+
+# run model
+harvested_model_S <- stan_glm(
+  logRR_mean ~ Harvested,
+  data = Our_data, family = gaussian,
+  prior_intercept = normal(PH[2], priors$SDlogRR[3]^2),
+  prior = normal(0, 2.5, autoscale = T), 
+  prior_aux = exponential(1, autoscale = T),
+  chains = 4, iter = 5000*2, seed = 84735)
+
+```
+
+#### Diagnostics & plots
+```{r}
+mcmc_trace(harvested_model_S, size = 0.1)
+mcmc_dens_overlay(harvested_model_S)
+mcmc_acf(harvested_model_S)
+
+# Posterior summary statistics
+tidy(harvested_model_S, effects = c("fixed", "aux"),
+     conf.int = TRUE, conf.level = 0.80) %>% 
+  select(-std.error)
+
+# pull out posterior values for parameters
+post_params_S <- as.data.frame(harvested_model_S) %>% 
+  mutate(non_harvested = `(Intercept)`, 
+         harvested = `(Intercept)` + HarvestedY) 
+
+# plot posterior modelled value distributions before transformation
+post_params_S %>% mcmc_areas(pars = c("(Intercept)", "HarvestedY", "sigma"))
+
+# plot posterior modelled value distributions after transformation
+post_params_S %>% mcmc_areas(pars = c("non_harvested", "harvested", "sigma"))
+```
+
+#### Modeled posterior values
+```{r}
+# table of the predicted parameter values
+post_model_S <- as_tibble(post_params_S) %>% 
+  select(non_harvested, harvested, sigma) %>% 
+  mutate(Var_recorded = "size") %>% 
+  pivot_longer(cols = non_harvested:harvested, names_to = "Harvested",
+               values_to = "mu")
+
+```
+
+#### Posterior prediction values
+```{r}
+# posterior predictions of mean non-harevsted and harvested values
+# uses the modelled posterior values to predict new (future) data
+# puts it into a form that can be eaisly plotted
+post_predict_S <- as_tibble(post_params_S) %>% 
+  mutate(non_harvested = rnorm(20000, non_harvested, sigma),
+         harvested = rnorm(20000, harvested, sigma)) %>% 
+  select(non_harvested, harvested) %>% 
+  pivot_longer(non_harvested:harvested, 
+               names_to = "spp_status", values_to = "post_prediction") %>% 
+  mutate(Var_recorded = "size")
+
+
+```
+
+
+### plotting all 
+
+Overview plot of our data (blue dots, mean = orange), a sample of the estimated mu and sigma (cyan dots and lines) and the prior values (red dots and lines = theta and tau)
+```{r}
+# join posterior parameter tables and sample for plotting
+post_plot <- rbind(post_model_BD, post_model_D, post_model_S) %>% 
+  group_by(Var_recorded) %>% slice_sample(n = 50) 
+
+# our data for ploatitng
+data_plot <- MA_Data_resH %>% filter(!Var_recorded %in% c("cover", "richness")) %>% 
+  mutate(Harvested = case_match(Harvested, "Y"~ "harvested", "N"~ "non_harvested"))
+
+# piors data for plotting
+priors_plot <- right_join(priorsH %>% 
+  mutate(Harvested = case_match(Harvested, "Y"~ "harvested", "N"~ "non_harvested")),
+  priors %>% filter(Var_recorded != "richness") %>% select(Var_recorded, SDlogRR), 
+  by = "Var_recorded")
+
+
+ggplot() +
+  geom_point(data = data_plot, aes(y = logRR_mean, x = 0.5),
+    size = 1.8, alpha = 0.6, colour = 'darkblue', stroke = NA,
+             position = position_jitter(width = 0.15, seed = 957)) +
+  stat_summary(data = data_plot, aes(y = logRR_mean, x = 0.5),
+               fun = mean, colour = "orange", geom = "point", size = 3) +
+  geom_point(data = post_plot, aes(y = mu, x = 1),
+    size = 3, alpha = 0.4, colour = 'darkcyan', stroke = NA,
+             position = position_jitter(width = 0.25, seed = 123)) +
+  geom_linerange(data = post_plot,
+                 aes(y = mu, x = 1, ymin = mu-sigma^2, ymax = mu+sigma^2),
+                 size = 0.5, alpha = 0.3, colour = 'darkcyan',
+                  position = position_jitter(width = 0.25, seed = 123)) +
+  geom_point(data = priors_plot, aes(y = logRR, x = 1),
+             shape = 15, size = 3, alpha = 0.9, colour = 'red', stroke = NA) +
+  geom_linerange(data = priors_plot,
+                 aes(y = logRR, x = 1,
+                     ymin = logRR-SDlogRR^2, ymax = logRR+SDlogRR^2),
+                 size = 1, alpha = 0.8, colour = 'red') +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  facet_grid(rows = vars(Var_recorded), cols = vars(Harvested), scales = "free_y") +
+  theme_light() +
+  theme(axis.text.x = element_blank(), axis.ticks.x = element_blank(),
+        panel.grid.major.x = element_blank(), panel.grid.minor.x = element_blank()) +
+  xlab("") + ylab("logRR") +
+  xlim(c(0.2,1.4))
+  
+  
+
+```
+
+Posterior model estimates
+```{r}
+# join posterior prediction tables
+post_pred_plot <- rbind(post_predict_BD, post_predict_D, post_predict_S) 
+
+ggplot(post_pred_plot,
+       aes(x = post_prediction, fill = spp_status, color = spp_status)) +
+  geom_density(alpha = 0.1) +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  facet_grid(rows = vars(Var_recorded), scales = "free") +
+  scale_fill_manual(values = c("darkred", "darkblue")) +
+  scale_colour_manual(values = c("darkred", "darkblue")) +
+  theme_light() +
+  xlab("Posterior model prediction (mean logRR value per reserve)")
+
+```
+
+
+
+## Comparison predictor
+
+Using comparison type used (IO, BA, IOBA) as a categorical predictor.
+
+### Priors
+using the same prior for all as we don't have data from Lester broken down by comparison type. This is the overarching priors, same as used in the base model: `priors`
+
+### MA data
+```{r}
+# summarise by individual reserve and comparios (study) type used
+MA_Data_resC <- MA_Data %>% 
+  group_by(Reserve, Var_recorded, Study_type) %>% 
+  summarise(across(c(logRR, Response_ratio, Percent_change),
+                   list(mean = mean)))
+
+```
+
+### biomassden
+```{r}
+
+# data = our collected MA data
+Our_data <- MA_Data_resC %>% filter(Var_recorded == "biomassden") %>% 
+  mutate(Study_type = factor(Study_type, levels = c("IO", "IOBA")))
+
+PC <- priors %>% 
+  filter(Var_recorded == "biomassden") 
+
+# run model
+comparison_model_BD <- stan_glm(
+  logRR_mean ~ Study_type,
+  data = Our_data, 
+  family = gaussian,
+  prior_intercept = normal(PC$meanlogRR, PC$SDlogRR^2),
+  prior = normal(0, 2.5, autoscale = T), 
+  prior_aux = exponential(1, autoscale = T),
+  chains = 4, iter = 5000*2)
+
+comparison_model_BD 
+
+```
+
+#### Diagnostics & plots
+```{r}
+mcmc_trace(comparison_model_BD, size = 0.1)
+mcmc_dens_overlay(comparison_model_BD)
+mcmc_acf(comparison_model_BD)
+
+# Posterior summary statistics
+tidy(comparison_model_BD, effects = c("fixed", "aux"),
+     conf.int = TRUE, conf.level = 0.80) %>% 
+  select(-std.error)
+
+# pull out posterior values for parameters
+post_params_BD <- as.data.frame(comparison_model_BD) %>% 
+  mutate(IO = `(Intercept)`, 
+         IOBA = `(Intercept)` + Study_typeIOBA) 
+
+# plot posterior modelled value distributions before transformation
+post_params_BD %>% mcmc_areas(pars = c("(Intercept)", "Study_typeIOBA", "sigma"))
+
+# plot posterior modelled value distributions after transformation
+post_params_BD %>% mcmc_areas(pars = c("IO", "IOBA", "sigma"))
+```
+ 
+
+#### Modeled posterior values
+```{r}
+# table of the predicted parameter values
+post_model_BD <- as_tibble(post_params_BD) %>% 
+  select(IO, IOBA, sigma) %>% 
+  mutate(Var_recorded = "biomassden") %>% 
+  pivot_longer(cols = IO:IOBA, names_to = "Study_type",
+               values_to = "mu")
+
+```
+
+#### Posterior prediction values
+```{r}
+# posterior predictions of mean non-harevsted and harvested values
+# uses the modelled posterior values to predict new (future) data
+# puts it into a form that can be eaisly plotted
+post_predict_BD <- as_tibble(post_params_BD) %>% 
+  mutate(IO = rnorm(20000, IO, sigma),
+         IOBA = rnorm(20000, IOBA, sigma)) %>% 
+  select(IO, IOBA) %>% 
+  pivot_longer(IO:IOBA, 
+               names_to = "spp_status", values_to = "post_prediction") %>% 
+  mutate(Var_recorded = "biomassden")
+
+
+```
+
+### density
+```{r}
+# data = our collected MA data
+Our_data <- MA_Data_resC %>% filter(Var_recorded == "density") %>% 
+  mutate(Study_type = as.factor(Study_type))
+
+PC <- priors %>% 
+  filter(Var_recorded == "density") 
+
+# run model
+comparison_model_D <- stan_glm(
+  logRR_mean ~ Study_type,
+  data = Our_data, 
+  family = gaussian,
+  prior_intercept = normal(PC$meanlogRR, PC$SDlogRR^2),
+  prior = normal(0, 2.5, autoscale = T), 
+  prior_aux = exponential(1, autoscale = T),
+  chains = 4, iter = 5000*2, seed = 84735)
+
+comparison_model_D 
+
+```
+
+#### Diagnostics & plots
+```{r}
+mcmc_trace(comparison_model_D, size = 0.1)
+mcmc_dens_overlay(comparison_model_D)
+mcmc_acf(comparison_model_D)
+
+# Posterior summary statistics
+tidy(comparison_model_D, effects = c("fixed", "aux"),
+     conf.int = TRUE, conf.level = 0.80) %>% 
+  select(-std.error)
+
+# pull out posterior values for parameters
+post_params_D <- as.data.frame(comparison_model_D) %>% 
+  mutate(IO = `(Intercept)`, 
+         IOBA = `(Intercept)` + Study_typeIOBA,
+         BA = `(Intercept)` + Study_typeBA) 
+
+# plot posterior modelled value distributions before transformation
+post_params_D %>% mcmc_areas(pars = c("(Intercept)", "Study_typeIOBA", "Study_typeBA", "sigma"))
+
+# plot posterior modelled value distributions after transformation
+post_params_D %>% mcmc_areas(pars = c("IO", "IOBA", "BA", "sigma"))
+```
+
+#### Modeled posterior values
+```{r}
+# table of the predicted parameter values
+post_model_D <- as_tibble(post_params_D) %>% 
+  select(IO, IOBA, BA, sigma) %>% 
+  mutate(Var_recorded = "density") %>% 
+  pivot_longer(cols = IO:BA, names_to = "Study_type",
+               values_to = "mu")
+
+```
+
+#### Posterior prediction values
+```{r}
+# posterior predictions of mean non-harevsted and harvested values
+# uses the modelled posterior values to predict new (future) data
+# puts it into a form that can be eaisly plotted
+post_predict_D <- as_tibble(post_params_D) %>% 
+  mutate(IO = rnorm(20000, IO, sigma),
+         IOBA = rnorm(20000, IOBA, sigma),
+         BA = rnorm(20000, BA, sigma)) %>% 
+  select(IO, IOBA, BA) %>% 
+  pivot_longer(IO:BA, 
+               names_to = "spp_status", values_to = "post_prediction") %>% 
+  mutate(Var_recorded = "density")
+
+
+```
+
+
+### size
+```{r}
+
+# data = our collected MA data
+Our_data <- MA_Data_resC %>% filter(Var_recorded == "size") %>% 
+  mutate(Study_type = factor(Study_type))
+
+PC <- priors %>% 
+  filter(Var_recorded == "size") 
+
+# run model
+comparison_model_S <- stan_glm(
+  logRR_mean ~ Study_type,
+  data = Our_data, 
+  family = gaussian,
+  prior_intercept = normal(PC$meanlogRR, PC$SDlogRR^2),
+  prior = normal(0, 2.5, autoscale = T), 
+  prior_aux = exponential(1, autoscale = T),
+  chains = 4, iter = 5000*2)
+
+comparison_model_S 
+
+```
+
+#### Diagnostics & plots
+```{r}
+mcmc_trace(comparison_model_S, size = 0.1)
+mcmc_dens_overlay(comparison_model_S)
+mcmc_acf(comparison_model_S)
+
+# Posterior summary statistics
+tidy(comparison_model_S, effects = c("fixed", "aux"),
+     conf.int = TRUE, conf.level = 0.80) %>% 
+  select(-std.error)
+
+# pull out posterior values for parameters
+post_params_S <- as.data.frame(comparison_model_S) %>% 
+  mutate(IO = `(Intercept)`, 
+         IOBA = `(Intercept)` + Study_typeIOBA) 
+
+# plot posterior modelled value distributions before transformation
+post_params_S %>% mcmc_areas(pars = c("(Intercept)", "Study_typeIOBA", "sigma"))
+
+# plot posterior modelled value distributions after transformation
+post_params_S %>% mcmc_areas(pars = c("IO", "IOBA", "sigma"))
+```
+ 
+
+#### Modeled posterior values
+```{r}
+# table of the predicted parameter values
+post_model_S <- as_tibble(post_params_S) %>% 
+  select(IO, IOBA, sigma) %>% 
+  mutate(Var_recorded = "size") %>% 
+  pivot_longer(cols = IO:IOBA, names_to = "Study_type",
+               values_to = "mu")
+
+```
+
+#### Posterior prediction values
+```{r}
+# posterior predictions of mean non-harevsted and harvested values
+# uses the modelled posterior values to predict new (future) data
+# puts it into a form that can be eaisly plotted
+post_predict_S <- as_tibble(post_params_S) %>% 
+  mutate(IO = rnorm(20000, IO, sigma),
+         IOBA = rnorm(20000, IOBA, sigma)) %>% 
+  select(IO, IOBA) %>% 
+  pivot_longer(IO:IOBA, 
+               names_to = "spp_status", values_to = "post_prediction") %>% 
+  mutate(Var_recorded = "size")
+
+
+```
+
+
+### plotting all 
+
+Overview plot of our data (blue dots, mean = orange), a sample of the estimated mu and sigma (cyan dots and lines) and the prior values (red dots and lines = theta and tau)
+```{r}
+# join posterior parameter tables and sample for plotting
+post_plot <- rbind(post_model_BD, post_model_D, post_model_S) %>% 
+  group_by(Var_recorded) %>% slice_sample(n = 50) 
+
+# our data for ploatitng
+data_plot <- MA_Data_resC 
+
+# piors data for plotting
+priors_plot <- priors %>% filter(Var_recorded != "richness")
+
+
+ggplot() +
+  geom_point(data = data_plot, aes(y = logRR_mean, x = 0.5),
+    size = 1.8, alpha = 0.6, colour = 'darkblue', stroke = NA,
+             position = position_jitter(width = 0.15, seed = 957)) +
+  stat_summary(data = data_plot, aes(y = logRR_mean, x = 0.5),
+               fun = mean, colour = "orange", geom = "point", size = 3) +
+  geom_point(data = post_plot, aes(y = mu, x = 1),
+    size = 3, alpha = 0.4, colour = 'darkcyan', stroke = NA,
+             position = position_jitter(width = 0.25, seed = 123)) +
+  geom_linerange(data = post_plot,
+                 aes(y = mu, x = 1, ymin = mu-sigma^2, ymax = mu+sigma^2),
+                 size = 0.5, alpha = 0.3, colour = 'darkcyan',
+                  position = position_jitter(width = 0.25, seed = 123)) +
+  geom_point(data = priors_plot, aes(y = meanlogRR, x = 1),
+             shape = 15, size = 3, alpha = 0.9, colour = 'red', stroke = NA) +
+  geom_linerange(data = priors_plot,
+                 aes(y = meanlogRR, x = 1,
+                     ymin = meanlogRR-SDlogRR^2, ymax = meanlogRR+SDlogRR^2),
+                 size = 1, alpha = 0.8, colour = 'red') +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  facet_grid(rows = vars(Var_recorded), cols = vars(Study_type), scales = "free_y") +
+  theme_light() +
+  theme(axis.text.x = element_blank(), axis.ticks.x = element_blank(),
+        panel.grid.major.x = element_blank(), panel.grid.minor.x = element_blank()) +
+  xlab("") + ylab("logRR") +
+  xlim(c(0.2,1.4))
+  
+  
+
+```
+
+Posterior model estimates
+```{r}
+# join posterior prediction tables
+post_pred_plot <- rbind(post_predict_BD, post_predict_D, post_predict_S) 
+
+ggplot(post_pred_plot,
+       aes(x = post_prediction, fill = spp_status, color = spp_status)) +
+  geom_density(alpha = 0.1) +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  facet_grid(rows = vars(Var_recorded), scales = "free") +
+  # scale_fill_manual(values = c("darkred", "darkblue")) +
+  # scale_colour_manual(values = c("darkred", "darkblue")) +
+  theme_light() +
+  xlab("Posterior model prediction (mean logRR value per reserve)")
+
+```
+
+
+
+## Harvest x comparison type predictors
+
+Using harvesting status (is the species harvested or not?) and comparison type used (IO, BA, IOBA) as categorical predictors.
+
+### Priors
+using the same prior for all as we don't have data from Lester broken down by comparison type x harvested. This is the overarching priors, same as used in the base model: `priors`
+
+### MA data
+```{r}
+# add BA from BACI studies
+# (and recalculate values)
+extraBA <- MA_Data %>% 
+  filter(Var_recorded != "cover") %>%   
+  filter(BACIwBA == 1) %>% 
+  mutate(Study_type = 'BA', Response_ratio = AI/BI,
+         logRR = log10(Response_ratio))
+
+# summarise by individual reserve, harvest status and comparisons (study) type used
+MA_Data_resHC <- MA_Data %>% 
+  rbind(extraBA) %>%
+  group_by(Reserve, Var_recorded, Harvested, Study_type) %>% 
+  summarise(across(c(logRR, Response_ratio, Percent_change, BACIwBA),
+                   list(mean = mean))) %>% 
+  mutate(extraBA = factor(ifelse(BACIwBA_mean>0,1,0)))
+
+```
+
+
+### biomassden
+```{r}
+# data = our collected MA data
+Our_data <- MA_Data_resHC %>% filter(Var_recorded == "biomassden") 
+
+PHC <- priors %>% 
+  filter(Var_recorded == "biomassden") 
+
+# run model
+HC_model_BD <- stan_glm(
+  logRR_mean ~ Harvested + Study_type,
+  data = Our_data,   family = gaussian,
+  prior_intercept = normal(PHC$meanlogRR, PHC$SDlogRR^2),
+  prior = normal(0, 2.5, autoscale = T),  # weakly informative prior
+  prior_aux = exponential(1, autoscale = T), # weakly informative prior 
+  chains = 4, iter = 5000*2)
+
+```
+
+#### Diagnostics & plots
+```{r}
+mcmc_trace(HC_model_BD, size = 0.1)
+mcmc_dens_overlay(HC_model_BD)
+mcmc_acf(HC_model_BD)
+
+# Posterior summary statistics
+tidy(HC_model_BD, effects = c("fixed", "aux"),
+     conf.int = TRUE, conf.level = 0.80) %>% 
+  select(-std.error)
+
+# pull out posterior values for parameters
+post_params_BD <- as.data.frame(HC_model_BD) %>% 
+  mutate(N_BA = `(Intercept)`, 
+         Y_BA = `(Intercept)` + HarvestedY,
+         N_IO = `(Intercept)` + Study_typeIO,
+         Y_IO = `(Intercept)` + HarvestedY + Study_typeIO,
+         N_IOBA = `(Intercept)` + Study_typeIOBA,
+         Y_IOBA = `(Intercept)` + HarvestedY  + Study_typeIOBA) 
+
+# plot posterior modelled value distributions before transformation
+post_params_BD %>% mcmc_areas(vars(`(Intercept)`:sigma))
+
+# plot posterior modelled value distributions after transformation
+post_params_BD %>% mcmc_areas(vars(sigma:Y_IOBA))
+```
+
+#### Modeled posterior values
+```{r}
+# table of the predicted parameter values
+post_model_BD <- as_tibble(post_params_BD) %>% 
+  select(sigma:Y_IOBA) %>% 
+  mutate(Var_recorded = "biomassden") %>% 
+  pivot_longer(cols = N_BA:Y_IOBA, 
+               names_to = "scenario",  values_to = "mu")
+
+```
+
+#### Posterior prediction values
+```{r}
+# posterior predictions of mean non-harevsted and harvested values
+# uses the modelled posterior values to predict new (future) data
+# puts it into a form that can be easily plotted
+post_predict_BD <- as_tibble(post_params_BD) %>% 
+  mutate_at(vars(N_BA:Y_IOBA),
+            ~rnorm(20000, ., sigma)) %>% 
+  select(N_BA:Y_IOBA) %>% 
+  pivot_longer(N_BA:Y_IOBA, 
+               names_to = "scenario", values_to = "post_prediction") %>% 
+  mutate(Var_recorded = "biomassden")
+
+
+```
+
+
+
+### density
+```{r}
+# switching to rstanarm from now on
+
+# data = our collected MA data
+Our_data <- MA_Data_resHC %>% filter(Var_recorded == "density") 
+
+PHC <- priors %>% 
+  filter(Var_recorded == "density") 
+
+# run model
+HC_model_D <- stan_glm(
+  logRR_mean ~ Harvested + Study_type,
+  data = Our_data,   family = gaussian,
+  prior_intercept = normal(PHC$meanlogRR, PHC$SDlogRR^2),
+  prior = normal(0, 2.5, autoscale = T),  # weakly informative prior
+  prior_aux = exponential(1, autoscale = T), # weakly informative prior 
+  chains = 4, iter = 5000*2)
+
+```
+
+#### Diagnostics & plots
+```{r}
+mcmc_trace(HC_model_D, size = 0.1)
+mcmc_dens_overlay(HC_model_D)
+mcmc_acf(HC_model_D)
+
+# Posterior summary statistics
+tidy(HC_model_D, effects = c("fixed", "aux"),
+     conf.int = TRUE, conf.level = 0.80) %>% 
+  select(-std.error)
+
+# pull out posterior values for parameters
+post_params_D <- as.data.frame(HC_model_D) %>% 
+  mutate(N_BA = `(Intercept)`, 
+         Y_BA = `(Intercept)` + HarvestedY,
+         N_IO = `(Intercept)` + Study_typeIO,
+         Y_IO = `(Intercept)` + HarvestedY + Study_typeIO,
+         N_IOBA = `(Intercept)` + Study_typeIOBA,
+         Y_IOBA = `(Intercept)` + HarvestedY  + Study_typeIOBA) 
+
+# plot posterior modelled value distributions before transformation
+post_params_D %>% mcmc_areas(vars(`(Intercept)`:sigma))
+
+# plot posterior modelled value distributions after transformation
+post_params_D %>% mcmc_areas(vars(sigma:Y_IOBA))
+```
+
+#### Modeled posterior values
+```{r}
+# table of the predicted parameter values
+post_model_D <- as_tibble(post_params_D) %>% 
+  select(sigma:Y_IOBA) %>% 
+  mutate(Var_recorded = "density") %>% 
+  pivot_longer(cols = N_BA:Y_IOBA, 
+               names_to = "scenario",  values_to = "mu")
+
+```
+
+#### Posterior prediction values
+```{r}
+# posterior predictions of mean non-harevsted and harvested values
+# uses the modelled posterior values to predict new (future) data
+# puts it into a form that can be easily plotted
+post_predict_D <- as_tibble(post_params_D) %>% 
+  mutate_at(vars(N_BA:Y_IOBA),
+            ~rnorm(20000, ., sigma)) %>% 
+  select(N_BA:Y_IOBA) %>% 
+  pivot_longer(N_BA:Y_IOBA, 
+               names_to = "scenario", values_to = "post_prediction") %>% 
+  mutate(Var_recorded = "density")
+
+```
+
+
+### size
+```{r}
+# switching to rstanarm from now on
+
+# data = our collected MA data
+Our_data <- MA_Data_resHC %>% filter(Var_recorded == "size") 
+
+PHC <- priors %>% 
+  filter(Var_recorded == "size") 
+
+# run model
+HC_model_S <- stan_glm(
+  logRR_mean ~ Harvested + Study_type,
+  data = Our_data,   family = gaussian,
+  prior_intercept = normal(PHC$meanlogRR, PHC$SDlogRR^2),
+  prior = normal(0, 2.5, autoscale = T),  # weakly informative prior
+  prior_aux = exponential(1, autoscale = T), # weakly informative prior 
+  chains = 4, iter = 5000*2)
+
+```
+
+#### Diagnostics & plots
+```{r}
+mcmc_trace(HC_model_S, size = 0.1)
+mcmc_dens_overlay(HC_model_S)
+mcmc_acf(HC_model_S)
+
+# Posterior summary statistics
+tidy(HC_model_S, effects = c("fixed", "aux"),
+     conf.int = TRUE, conf.level = 0.80) %>% 
+  select(-std.error)
+
+# pull out posterior values for parameters
+post_params_S <- as.data.frame(HC_model_S) %>% 
+  mutate(N_BA = `(Intercept)`, 
+         Y_BA = `(Intercept)` + HarvestedY,
+         N_IO = `(Intercept)` + Study_typeIO,
+         Y_IO = `(Intercept)` + HarvestedY + Study_typeIO,
+         N_IOBA = `(Intercept)` + Study_typeIOBA,
+         Y_IOBA = `(Intercept)` + HarvestedY  + Study_typeIOBA) 
+
+# plot posterior modelled value distributions before transformation
+post_params_S %>% mcmc_areas(vars(`(Intercept)`:sigma))
+
+# plot posterior modelled value distributions after transformation
+post_params_S %>% mcmc_areas(vars(sigma:Y_IOBA))
+```
+
+#### Modeled posterior values
+```{r}
+# table of the predicted parameter values
+post_model_S <- as_tibble(post_params_S) %>% 
+  select(sigma:Y_IOBA) %>% 
+  mutate(Var_recorded = "size") %>% 
+  pivot_longer(cols = N_BA:Y_IOBA, 
+               names_to = "scenario",  values_to = "mu")
+
+```
+
+#### Posterior prediction values
+```{r}
+# posterior predictions of mean non-harevsted and harvested values
+# uses the modelled posterior values to predict new (future) data
+# puts it into a form that can be easily plotted
+post_predict_S <- as_tibble(post_params_S) %>% 
+  mutate_at(vars(N_BA:Y_IOBA),
+            ~rnorm(20000, ., sigma)) %>% 
+  select(N_BA:Y_IOBA) %>% 
+  pivot_longer(N_BA:Y_IOBA, 
+               names_to = "scenario", values_to = "post_prediction") %>% 
+  mutate(Var_recorded = "size")
+
+
+```
+
+
+### plotting all 
+
+Overview plot of our data (blue dots, mean = orange), a sample of the estimated mu and sigma (cyan dots and lines) and the prior values (red dots and lines = theta and tau)
+```{r}
+# join posterior parameter tables and sample for plotting
+post_plot <- rbind(post_model_BD, post_model_D, post_model_S) %>% 
+  group_by(Var_recorded) %>% slice_sample(n = 50) %>% 
+  separate_wider_delim(col = scenario, names = c("harvested", "study_type"), 
+                       delim = "_")
+  
+# our data for plotting
+data_plot <- MA_Data_resHC 
+
+# piors data for plotting
+priors_plot <- priors %>% filter(Var_recorded != "richness")
+
+
+plot_HC_func <- function(data_plot, priors_plot, post_plot) {
+  ggplot() +
+    geom_point(data = data_plot, aes(y = logRR_mean, x = 0.5),
+      size = 1.8, alpha = 0.6, colour = 'darkblue', stroke = NA,
+               position = position_jitter(width = 0.15, seed = 957)) +
+    stat_summary(data = data_plot, aes(y = logRR_mean, x = 0.5),
+                 fun = mean, colour = "orange", geom = "point", size = 3) +
+    geom_point(data = post_plot, aes(y = mu, x = 1),
+      size = 3, alpha = 0.4, colour = 'darkcyan', stroke = NA,
+               position = position_jitter(width = 0.25, seed = 123)) +
+    geom_linerange(data = post_plot,
+                   aes(y = mu, x = 1, ymin = mu-sigma^2, ymax = mu+sigma^2),
+                   size = 0.5, alpha = 0.3, colour = 'darkcyan',
+                    position = position_jitter(width = 0.25, seed = 123)) +
+    geom_point(data = priors_plot, aes(y = meanlogRR, x = 1),
+               shape = 15, size = 3, alpha = 0.9, colour = 'red', stroke = NA) +
+    geom_linerange(data = priors_plot,
+                   aes(y = meanlogRR, x = 1,
+                       ymin = meanlogRR-SDlogRR^2, ymax = meanlogRR+SDlogRR^2),
+                   size = 1, alpha = 0.8, colour = 'red') +
+    geom_hline(yintercept = 0, linetype = "dashed") +
+    facet_grid(rows = vars(study_type), cols = vars(Harvested), 
+               drop = F, scales = "free_y") +
+    theme_light() +
+    theme(axis.text.x = element_blank(), axis.ticks.x = element_blank(),
+          panel.grid.major.x = element_blank(), panel.grid.minor.x = element_blank()) +
+    xlab("") + ylab("logRR") +
+    xlim(c(0.2,1.4))
+  }
+
+plot_HC_func(data_plot %>% filter(Var_recorded == 'biomassden'),
+             priors_plot%>% filter(Var_recorded == 'biomassden'),
+             post_plot %>% filter(Var_recorded == 'biomassden')) 
+
+plot_HC_func(data_plot %>% filter(Var_recorded == 'density'),
+             priors_plot%>% filter(Var_recorded == 'density'),
+             post_plot %>% filter(Var_recorded == 'density'))
+
+plot_HC_func(data_plot %>% filter(Var_recorded == 'size'),
+             priors_plot%>% filter(Var_recorded == 'size'),
+             post_plot %>% filter(Var_recorded == 'size')) 
+  
+
+```
+
+Posterior model estimates
+```{r}
+# join posterior prediction tables
+post_pred_plot <- rbind(post_predict_BD, post_predict_D, post_predict_S) %>% 
+    separate_wider_delim(col = scenario, names = c("harvested", "study_type"), 
+                       delim = "_")
+
+PPP_sum <- post_pred_plot %>% group_by(harvested, study_type, Var_recorded) %>% 
+  summarise(mean = mean(post_prediction), median = median (post_prediction)) %>% 
+  mutate(lmin = ifelse(Var_recorded == "size", 3.5, 1),
+         lmax = ifelse(harvested == "Y", lmin + 0.5, lmin + 1),
+         llabel = round(mean,2))
+
+
+ggplot(post_pred_plot,
+       aes(x = post_prediction, fill = harvested, color = harvested)) +
+  geom_density(alpha = 0.1) +
+  geom_vline(xintercept = 0, linetype = "dashed", colour = 'grey70') +
+  geom_segment(data = PPP_sum, 
+               aes(x = mean, xend = mean, y = lmin, yend = lmax)) +
+  geom_text(data = PPP_sum, 
+               aes(x = mean, y = lmax + 0.2, label = llabel), hjust = 0) + 
+  facet_grid(cols = vars(study_type), rows = vars(Var_recorded), scales = 'free_y') +
+  scale_fill_manual(values = c("darkblue","darkred")) +
+  scale_colour_manual(values = c("darkblue","darkred")) +
+  theme_bw() +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank()) + 
+  xlab("Posterior model prediction (mean logRR value per reserve)")
+
+```
+
+
+
+## Reserve age x harvested predictor
+
+Using reserve age (in the final year the data was collected) and harvest status as predictors.
+
+### Priors
+using the same prior for all as we don't have suitable data from Lester. This is the overarching priors, same as used in the base model: `priors`
+
+### MA data
+```{r}
+# add BA from BACI studies
+# (and recalculate values)
+extraBA <- MA_Data %>% 
+  filter(Var_recorded != "cover") %>%   
+  filter(BACIwBA == 1) %>% 
+  mutate(Study_type = 'BA', Response_ratio = AI/BI,
+         logRR = log10(Response_ratio))
+
+# summarise by individual reserve and spp status
+# remove NAs in reserve age
+MA_Data_resAH <- MA_Data %>% 
+  rbind(extraBA) %>%
+  filter(!is.na(Res_age_end)) %>%
+  group_by(Reserve, Var_recorded, Res_age_end, Harvested) %>% 
+  summarise(across(c(logRR, Response_ratio, Percent_change, BACIwBA),
+                   list(mean = mean)))  %>% 
+  mutate(extraBA = factor(ifelse(BACIwBA_mean>0,1,0)))
+
+```
+
+
+### biomassden
+```{r}
+# data = our collected MA data
+Our_data <- MA_Data_resAH %>% filter(Var_recorded == "biomassden") %>% ungroup()
+
+PAH <- priors %>% 
+  filter(Var_recorded == "biomassden")
+
+# run model
+ageH_model_BD <- stan_glm(
+  logRR_mean ~ Res_age_end + Harvested + Res_age_end:Harvested,
+  data = Our_data, family = gaussian,
+  prior_intercept = normal(0, 2.5, autoscale = T), # weakly informative prior/default prior
+  prior = normal(0, 2.5, autoscale = T),  # weakly informative prior/default prior
+  prior_aux = exponential(1, autoscale = T), # weakly informative prior   
+  chains = 4, iter = 5000*2, seed = 84735)
+
+```
+
+#### Diagnostics & plots
+```{r}
+mcmc_trace(ageH_model_BD, size = 0.1)
+mcmc_dens_overlay(ageH_model_BD)
+mcmc_acf(ageH_model_BD)
+
+# Posterior summary statistics
+tidy(ageH_model_BD, effects = c("fixed", "aux"),
+     conf.int = TRUE, conf.level = 0.80) 
+
+# adjusted values
+tidy(ageH_model_BD, effects = c("fixed", "aux"),
+     conf.int = TRUE, conf.level = 0.80) %>% 
+  select(-std.error) %>% 
+  pivot_longer(cols = c(-term), names_to = "stat") %>% 
+  pivot_wider(names_from = c(term)) %>% 
+  transmute(stat =stat,
+            Intercept_N = `(Intercept)`, 
+            Slope_N = Res_age_end, 
+            Intercept_Y = `(Intercept)` + HarvestedY, 
+            Slope_Y = Res_age_end + `Res_age_end:HarvestedY`, 
+            sigma = sigma) 
+
+# pull out posterior values for parameters
+post_params_BD <- as.data.frame(ageH_model_BD) %>% 
+  transmute(Intercept_N = `(Intercept)`, 
+            Slope_N = Res_age_end, 
+            Intercept_Y = `(Intercept)` + HarvestedY, 
+            Slope_Y = Res_age_end + `Res_age_end:HarvestedY`, 
+            sigma = sigma) 
+
+# plot posterior modeled value distributions 
+post_params_BD %>% mcmc_areas()
+
+# look at adjusted priors
+prior_summary(ageH_model_BD)
+
+```
+
+```{r}
+# 50 simulated model lines
+# Model lines constructed from 50 posterior plausible sets of β0 and β1
+
+sim_BD <- Our_data %>% add_epred_draws(ageH_model_BD, ndraws = 50) %>% 
+         mutate(Var_recorded = "biomassden")
+
+```
+
+#### Modeled posterior values
+```{r}
+# table of the predicted parameter values
+post_model_BD <- as_tibble(post_params_BD) %>% 
+  mutate(Var_recorded = "biomassden") %>% 
+  pivot_longer(cols = Intercept_N:Slope_Y, names_to = "Scenario",
+               values_to = "mu")
+
+```
+
+
+
+### density
+```{r}
+# data = our collected MA data
+Our_data <- MA_Data_resAH %>% filter(Var_recorded == "density") %>% ungroup()
+
+PAH <- priors %>% 
+  filter(Var_recorded == "density")
+
+# run model
+ageH_model_D <- stan_glm(
+  logRR_mean ~ Res_age_end + Harvested + Res_age_end:Harvested ,
+  data = Our_data, family = gaussian,
+  prior_intercept = normal(0, 2.5, autoscale = T), # weakly informative prior/default prior
+  prior = normal(0, 2.5, autoscale = T),  # weakly informative prior/default prior
+  prior_aux = exponential(1, autoscale = T), # weakly informative prior  
+  chains = 4, iter = 5000*2, seed = 84735)
+
+```
+
+#### Diagnostics & plots
+```{r}
+mcmc_trace(ageH_model_D, size = 0.1)
+mcmc_dens_overlay(ageH_model_D)
+mcmc_acf(ageH_model_D)
+
+# Posterior summary statistics
+tidy(ageH_model_D, effects = c("fixed", "aux"),
+     conf.int = TRUE, conf.level = 0.80) %>% 
+  select(-std.error)
+
+# adjusted values
+tidy(ageH_model_D, effects = c("fixed", "aux"),
+     conf.int = TRUE, conf.level = 0.80) %>% 
+  select(-std.error) %>% 
+  pivot_longer(cols = c(-term), names_to = "stat") %>% 
+  pivot_wider(names_from = c(term)) %>% 
+  transmute(stat =stat,
+            Intercept_N = `(Intercept)`, 
+            Slope_N = Res_age_end, 
+            Intercept_Y = `(Intercept)` + HarvestedY, 
+            Slope_Y = Res_age_end + `Res_age_end:HarvestedY`, 
+            sigma = sigma) 
+
+# pull out posterior values for parameters
+post_params_D <- as.data.frame(ageH_model_D) %>% 
+  transmute(Intercept_N = `(Intercept)`, 
+            Slope_N = Res_age_end, 
+            Intercept_Y = `(Intercept)` + HarvestedY, 
+            Slope_Y = Res_age_end +  `Res_age_end:HarvestedY`,
+            sigma = sigma) 
+
+# plot posterior modeled value distributions 
+post_params_D %>% mcmc_areas()
+
+# look at adjusted priors
+prior_summary(ageH_model_D)
+
+```
+
+```{r}
+# 50 simulated model lines
+# Model lines constructed from 50 posterior plausible sets of β0 and β1
+
+sim_D <- Our_data %>% add_epred_draws(ageH_model_D, ndraws = 50) %>% 
+         mutate(Var_recorded = "density")
+
+```
+
+#### Modeled posterior values
+```{r}
+# table of the predicted parameter values
+post_model_D <- as_tibble(post_params_D) %>% 
+  mutate(Var_recorded = "density") %>% 
+  pivot_longer(cols = Intercept_N:Slope_Y, names_to = "Scenario",
+               values_to = "mu")
+
+```
+
+
+
+
+### size
+```{r}
+# data = our collected MA data
+Our_data <- MA_Data_resAH %>% filter(Var_recorded == "size") %>% ungroup()
+
+PAH <- priors %>% 
+  filter(Var_recorded == "size")
+
+# run model
+ageH_model_S <- stan_glm(
+  logRR_mean ~ Res_age_end + Harvested + Res_age_end:Harvested ,
+  data = Our_data, family = gaussian,
+  prior_intercept = normal(0, 2.5, autoscale = T), # weakly informative prior/default prior
+  prior = normal(0, 2.5, autoscale = T),  # weakly informative prior/default prior
+  prior_aux = exponential(1, autoscale = T), # weakly informative prior  
+  chains = 4, iter = 5000*2, seed = 84735)
+
+```
+
+#### Diagnostics & plots
+```{r}
+mcmc_trace(ageH_model_S, size = 0.1)
+mcmc_dens_overlay(ageH_model_S)
+mcmc_acf(ageH_model_S)
+
+# Posterior summary statistics
+tidy(ageH_model_S, effects = c("fixed", "aux"),
+     conf.int = TRUE, conf.level = 0.80) %>% 
+  select(-std.error)
+
+# adjusted values
+tidy(ageH_model_S, effects = c("fixed", "aux"),
+     conf.int = TRUE, conf.level = 0.80) %>% 
+  select(-std.error) %>% 
+  pivot_longer(cols = c(-term), names_to = "stat") %>% 
+  pivot_wider(names_from = c(term)) %>% 
+  transmute(stat =stat,
+            Intercept_N = `(Intercept)`, 
+            Slope_N = Res_age_end, 
+            Intercept_Y = `(Intercept)` + HarvestedY, 
+            Slope_Y = Res_age_end + `Res_age_end:HarvestedY`, 
+            sigma = sigma) 
+
+
+# pull out posterior values for parameters
+post_params_S <- as.data.frame(ageH_model_S) %>% 
+  transmute(Intercept_N = `(Intercept)`, 
+            Slope_N = Res_age_end, 
+            Intercept_Y = `(Intercept)` + HarvestedY, 
+            Slope_Y = Res_age_end + `Res_age_end:HarvestedY`, 
+            sigma = sigma) 
+
+# plot posterior modeled value distributions 
+post_params_S %>% mcmc_areas()
+
+# look at adjusted priors
+prior_summary(ageH_model_S)
+
+```
+
+```{r}
+# 50 simulated model lines
+# Model lines constructed from 50 posterior plausible sets of β0 and β1
+
+
+sim_S <- Our_data %>% add_epred_draws(ageH_model_S, ndraws = 50) %>% 
+         mutate(Var_recorded = "size")
+
+```
+
+#### Modeled posterior values
+```{r}
+# table of the predicted parameter values
+post_model_S <- as_tibble(post_params_S) %>% 
+  mutate(Var_recorded = "density") %>% 
+  pivot_longer(cols = Intercept_N:Slope_Y, names_to = "Scenario",
+               values_to = "mu")
+
+```
+
+
+
+
+### Plotting all
+Posterior model estimates
+
+Paras:
+```{r}
+
+post_para_plot <- rbind(post_params_BD %>% mutate(Var_recorded = "biomassden"), 
+                        post_params_D %>% mutate(Var_recorded = "density"),
+                        post_params_S %>% mutate(Var_recorded = "size")) %>% 
+  select(-sigma) %>% 
+  pivot_longer(Intercept_N:Slope_Y, names_to = 'scenario') %>% 
+  separate_wider_delim(cols = scenario, delim = "_", names = c("para", 'harvested'))
+
+
+PPP_sum <- post_para_plot %>% group_by(harvested, para, Var_recorded) %>% 
+  summarise(mean = mean(value), median = median(value)) %>% 
+  mutate(lmin = ifelse(Var_recorded == "biomassden", 50, ifelse(Var_recorded == "size", 50, 50)),
+         lmin = ifelse(harvested == "N" & Var_recorded == "size", lmin+50, lmin),
+         lmax = lmin + 10,
+         llabel = round(mean,2))
+
+
+ggplot(post_para_plot,
+       aes(x = value,
+           fill = harvested, color = harvested)) +
+  geom_density(alpha = 0.1) +
+  geom_vline(xintercept = 0, linetype = "dashed", colour = 'grey70') +
+  # geom_segment(data = PPP_sum,
+  #              aes(x = mean, xend = mean, y = lmin, yend = lmax)) +
+  geom_text(data = PPP_sum,
+               aes(x = mean, y = lmax + 0.2, label = llabel), hjust = 0) +
+  facet_grid(cols = vars(para), rows = vars(Var_recorded), scales = 'free') +
+  scale_fill_manual(values = c("darkblue","darkred")) +
+  scale_colour_manual(values = c("darkblue","darkred")) +
+  theme_bw() +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank()) + 
+  xlab("Posterior prediction for model parameters (mean logRR value per reserve)")+
+  ylab("")
+
+
+
+
+```
+
+Model & Data:
+```{r}
+# join posterior prediction tables
+post_pred_plot <- rbind(sim_BD, sim_D, sim_S)
+  
+
+ggplot(post_pred_plot,
+       aes(x = Res_age_end, y = logRR_mean, colour = Harvested)) +
+    geom_line(aes(y = .epred, group = paste(Harvested, .draw)), alpha = 0.1) + 
+    geom_point(data = MA_Data_resAH, size = 1.5, alpha = 0.5, stroke = NA) +
+    facet_grid(rows = vars(Var_recorded)) +
+    scale_colour_manual(values = c("darkblue", "darkred")) +
+    theme_bw()
+
+
+```
+
+
+
+
+
+
+
+## Reserve age predictor
+
+Using reserve age (in the final year the data was collected) as a predictor.
+
+### Priors
+using the same prior for all as we don't have suitable data from Lester. This is the overarching priors, same as used in the base model: `priors`
+
+### MA data
+```{r}
+# summarise by individual reserve and spp status
+# remove NAs in reserve age
+MA_Data_resA <- MA_Data %>% 
+  filter(!is.na(Res_age_end)) %>%
+  group_by(Reserve, Var_recorded, Res_age_end) %>% 
+  summarise(across(c(logRR, Response_ratio, Percent_change),
+                   list(mean = mean)))
+
+```
+
+### biomassden
+```{r}
+# data = our collected MA data
+Our_data <- MA_Data_resA %>% filter(Var_recorded == "biomassden") %>% ungroup()
+
+PA <- priors %>% 
+  filter(Var_recorded == "biomassden")
+
+# run model
+age_model_BD <- stan_glm(
+  logRR_mean ~ Res_age_end,
+  data = Our_data, family = gaussian,
+  prior_intercept = normal(0, 2.5, autoscale = T), # weakly informative prior/default prior
+  prior = normal(0, 2.5, autoscale = T),  # weakly informative prior/default prior
+  prior_aux = exponential(PA$SDlogRR),  
+  chains = 4, iter = 5000*2, seed = 84735)
+
+```
+
+#### Diagnostics & plots
+```{r}
+mcmc_trace(age_model_BD, size = 0.1)
+mcmc_dens_overlay(age_model_BD)
+mcmc_acf(age_model_BD)
+
+# Posterior summary statistics
+tidy(age_model_BD, effects = c("fixed", "aux"),
+     conf.int = TRUE, conf.level = 0.80) %>% 
+  select(-std.error)
+
+# pull out posterior values for parameters
+post_params_BD <- as.data.frame(age_model_BD) %>% 
+  transmute(Intercept = `(Intercept)`, 
+            Slope = Res_age_end, sigma = sigma) 
+
+# plot posterior modelled value distributions 
+post_params_BD %>% mcmc_areas(pars = c("Intercept", "Slope", "sigma"))
+
+# look at adjusted priors
+prior_summary(age_model_BD)
+
+```
+
+```{r}
+# 50 simulated model lines
+# Model lines constructed from 50 posterior plausible sets of β0 and β1
+
+Our_data %>% add_epred_draws(age_model_BD, ndraws = 50) %>%
+    ggplot(aes(x = Res_age_end, y = logRR_mean)) +
+    geom_line(aes(y = .epred, group = .draw), alpha = 0.15) + 
+    geom_point(data = Our_data, size = 1)
+
+
+sim_BD <- Our_data %>% add_epred_draws(age_model_BD, ndraws = 50) %>% 
+         mutate(Var_recorded = "biomassden")
+
+```
+
+#### Modeled posterior values
+```{r}
+# table of the predicted parameter values
+post_model_BD <- as_tibble(post_params_BD) %>% 
+  mutate(Var_recorded = "biomassden") %>% 
+  pivot_longer(cols = non_harvested:harvested, names_to = "Harvested",
+               values_to = "mu")
+
+```
+
+#### Posterior prediction values
+```{r}
+# posterior predictions of mean non-harevsted and harvested values
+# uses the modelled posterior values to predict new (future) data
+# puts it into a form that can be eaisly plotted
+post_predict_BD <- as_tibble(post_params_BD) %>% 
+  mutate(non_harvested = rnorm(20000, non_harvested, sigma),
+         harvested = rnorm(20000, harvested, sigma)) %>% 
+  select(non_harvested, harvested) %>% 
+  pivot_longer(non_harvested:harvested, 
+               names_to = "spp_status", values_to = "post_prediction") %>% 
+  mutate(Var_recorded = "biomassden")
+
+
+```
+
+
+
+### density
+```{r}
+# data = our collected MA data
+Our_data <- MA_Data_resA %>% filter(Var_recorded == "density") %>% ungroup()
+
+PA <- priors %>% 
+  filter(Var_recorded == "density")
+
+# run model
+age_model_D <- stan_glm(
+  logRR_mean ~ Res_age_end,
+  data = Our_data, family = gaussian,
+  prior_intercept = normal(0, 2.5, autoscale = T), # weakly informative prior/default prior
+  prior = normal(0, 2.5, autoscale = T),  # weakly informative prior/default prior
+  prior_aux = exponential(PA$SDlogRR),  
+  chains = 4, iter = 5000*2)
+
+```
+
+#### Diagnostics & plots
+```{r}
+mcmc_trace(age_model_D, size = 0.1)
+mcmc_dens_overlay(age_model_D)
+mcmc_acf(age_model_D)
+
+# Posterior summary statistics
+tidy(age_model_D, effects = c("fixed", "aux"),
+     conf.int = TRUE, conf.level = 0.80) %>% 
+  select(-std.error)
+
+# pull out posterior values for parameters
+post_params_D <- as.data.frame(age_model_D) %>% 
+  transmute(Intercept = `(Intercept)`, 
+            Slope = Res_age_end, sigma = sigma) 
+
+# plot posterior modelled value distributions 
+post_params_D %>% mcmc_areas(pars = c("Intercept", "Slope", "sigma"))
+
+# look at adjusted priors
+prior_summary(age_model_D)
+
+```
+
+```{r}
+# 50 simulated model lines
+# Model lines constructed from 50 posterior plausible sets of β0 and β1
+
+Our_data %>% add_epred_draws(age_model_D, ndraws = 50) %>%
+    ggplot(aes(x = Res_age_end, y = logRR_mean)) +
+    geom_line(aes(y = .epred, group = .draw), alpha = 0.15) + 
+    geom_point(data = Our_data, size = 1)
+
+sim_D <- Our_data %>% add_epred_draws(age_model_D, ndraws = 50) %>% 
+         mutate(Var_recorded = "density")
+
+
+```
+
+
+
+### size
+```{r}
+# data = our collected MA data
+Our_data <- MA_Data_resA %>% filter(Var_recorded == "size") %>% ungroup()
+
+PA <- priors %>% 
+  filter(Var_recorded == "size")
+
+# run model
+age_model_S <- stan_glm(
+  logRR_mean ~ Res_age_end,
+  data = Our_data, family = gaussian,
+  prior_intercept = normal(0, 2.5, autoscale = T), # weakly informative prior/default prior
+  prior = normal(0, 2.5, autoscale = T),  # weakly informative prior/default prior
+  prior_aux = exponential(PA$SDlogRR),  
+  chains = 4, iter = 5000*2)
+
+```
+
+#### Diagnostics & plots
+```{r}
+mcmc_trace(age_model_S, size = 0.1)
+mcmc_dens_overlay(age_model_S)
+mcmc_acf(age_model_S)
+
+# Posterior summary statistics
+tidy(age_model_S, effects = c("fixed", "aux"),
+     conf.int = TRUE, conf.level = 0.80) %>% 
+  select(-std.error)
+
+# pull out posterior values for parameters
+post_params_S <- as.data.frame(age_model_S) %>% 
+  transmute(Intercept = `(Intercept)`, 
+            Slope = Res_age_end, sigma = sigma) 
+
+# plot posterior modelled value distributions 
+post_params_S %>% mcmc_areas(pars = c("Intercept", "Slope", "sigma"))
+
+# look at adjusted priors
+prior_summary(age_model_S)
+
+```
+
+```{r}
+# 50 simulated model lines
+# Model lines constructed from 50 posterior plausible sets of β0 and β1
+
+Our_data %>% add_epred_draws(age_model_S, ndraws = 50) %>%
+    ggplot(aes(x = Res_age_end, y = logRR_mean)) +
+    geom_line(aes(y = .epred, group = .draw), alpha = 0.15) + 
+    geom_point(data = Our_data, size = 1)
+
+sim_S <- Our_data %>% add_epred_draws(age_model_S, ndraws = 50) %>% 
+         mutate(Var_recorded = "size")
+
+
+```
+
+
+### Plotting all
+
+Posterior model estimates
+```{r}
+# join posterior prediction tables
+post_pred_plot <- rbind(sim_BD, sim_D, sim_S)
+
+ggplot(post_pred_plot,
+       aes(x = Res_age_end, y = logRR_mean)) +
+    geom_line(aes(y = .epred, group = .draw), alpha = 0.15) + 
+    geom_point(data = MA_Data_resA, size = 1) +
+    facet_grid(rows = vars(Var_recorded), scales = "free")
+
+
+```
+
+
+
+
+
+
+
+
+
+
+
